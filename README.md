@@ -1,1 +1,5 @@
-2025-12-17 13:54:35,890|WARN |[org.springframework.jms.listener.DefaultMessageListenerContainer]|DefaultMessageListenerContainer|(jmsContainer-9)|||Setup of JMS message listener invoker failed for destination 'queue://RequestsQ?busName=UIM2Bus' - trying to recover. Cause: CWSIA0086E: Failed to create a MessageConsumer for queue://RequestsQ?busName=UIM2Bus; nested exception is com.ibm.ws.sib.processor.exceptions.SIMPNotPossibleInCurrentConfigurationException: CWSIK0015E: The destination RequestsQ was not found on messaging engine node11.uimDEV2Server1-UIM2Bus.
+Fatal (UNEXPECTED_MESSAGE): java.net.SocketException: Connection reset (
+"throwable"
+(CERTIFICATE_UNKNOWN): com.ibm.jsse2.util.j: PKIX path building failed: com.ibm.security.cert.IBMCertPathBuilderException: unable to find valid certification path to requested target (
+"throwable" : {
+  com.ibm.jsse2.util.j: PKIX path building failed: com.ibm.security.cert.IBMCertPathBuilderException: unable to find valid certification path to requested target
