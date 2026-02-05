@@ -1,129 +1,124 @@
 #!/bin/bash
 
-################################################################################
-# Tool Name   : startWebSphere.sh (cleaned)
-# Purpose     : Start nodeagent and all JVMs listed in ck_WAS.list
-# Notes       : Hostname-based JVM filtering REMOVED
-################################################################################
+###############################################################################
+# startWebSphere.sh - CLEANED NON-BLOCKING VERSION
+#
+# Changes:
+#   - Removed hostname/JVM number filtering
+#   - Starts ALL JVMs listed in ck_WAS.list
+#   - No blocking wait after batch start
+#   - Prevents script hanging after first batch
+###############################################################################
 
-# ======================
+#############################
 # CONFIGURATION
-# ======================
+#############################
+
 VERSION=v90
 PROFILE_NAME=node11
 
 JVMLISTFILE=/opt/WebSphere/v90/wcc/bin/jvmrecycle/ck_WAS.list
 JAVASHAREDRESOURCES="/tmp/javasharedresources"
 
-batch=10
-START_TIMEOUT=240
 ret=0
 
-# ======================
-# VALIDATIONS
-# ======================
+#############################
+# VALIDATION
+#############################
+
 if [ ! -d /opt/WebSphere/$VERSION/AppServer/profiles/$PROFILE_NAME ]; then
-  echo "[FATAL] Invalid PROFILE_NAME or VERSION"
-  exit 1
+    echo "[FATAL] Invalid VERSION or PROFILE_NAME"
+    exit 1
 fi
 
 if [ ! -s "$JVMLISTFILE" ]; then
-  echo "[FATAL] JVM list file missing or empty: $JVMLISTFILE"
-  exit 1
+    echo "[FATAL] JVM list file missing or empty"
+    exit 1
 fi
 
-# ======================
+#############################
 # FUNCTIONS
-# ======================
+#############################
+
 serverStarted() {
   /opt/WebSphere/$VERSION/AppServer/profiles/$PROFILE_NAME/bin/serverStatus.sh "$1" \
-    | grep -q "STARTED"
+      | grep -q "STARTED"
 }
 
 startServer() {
-  local SERVER=$1
 
-  if ps -ef | grep -w "$SERVER" | grep -v grep >/dev/null; then
-    echo "WARN: $SERVER already running"
-    return
+  SERVER=$1
+
+  ps -ef | grep -w "$SERVER" | grep -v grep >/dev/null
+  if [[ $? -eq 0 ]]; then
+      echo "WARN: $SERVER already running"
+      return
   fi
 
   if [[ "$SERVER" == "nodeagent" ]]; then
-    /opt/WebSphere/$VERSION/AppServer/profiles/$PROFILE_NAME/bin/startNode.sh \
-      | grep "open for e-business"
+      /opt/WebSphere/$VERSION/AppServer/profiles/$PROFILE_NAME/bin/startNode.sh \
+          | grep "open for e-business"
   else
-    /opt/WebSphere/$VERSION/AppServer/profiles/$PROFILE_NAME/bin/startServer.sh \
-      "$SERVER" -nowait -quiet
+      /opt/WebSphere/$VERSION/AppServer/profiles/$PROFILE_NAME/bin/startServer.sh \
+          "$SERVER" -nowait -quiet
   fi
 }
 
-# ======================
-# PRE-START CLEANUP
-# ======================
+#############################
+# PRE-CLEANUP
+#############################
+
 if [[ -d "$JAVASHAREDRESOURCES" ]]; then
-  rm -f "$JAVASHAREDRESOURCES"/*semaphore* "$JAVASHAREDRESOURCES"/*memory* 2>/dev/null
+   rm -f "$JAVASHAREDRESOURCES"/*semaphore* 2>/dev/null
+   rm -f "$JAVASHAREDRESOURCES"/*memory* 2>/dev/null
 fi
 
 chmod -R g+w /opt/WebSphere/$VERSION/AppServer/profiles/$PROFILE_NAME
 
-# ======================
+#############################
 # START NODEAGENT
-# ======================
+#############################
+
 echo "INFO: Starting nodeagent..."
 startServer nodeagent
 
+sleep 10
+
 if ! serverStarted nodeagent; then
-  echo "ERROR: nodeagent failed to start"
-  exit 1
+    echo "ERROR: nodeagent failed to start"
+    exit 1
 fi
 
-# ======================
-# LOAD JVM LIST (ALL JVMs)
-# ======================
+#############################
+# LOAD ALL JVMs FROM FILE
+#############################
+
 APP_SERVER_LIST=$(egrep -v '(^[[:space:]]*#|^[[:space:]]*$)' "$JVMLISTFILE")
 
-# ======================
-# START JVMs IN BATCHES
-# ======================
-BATCH_LIST=""
-count=0
+#############################
+# START ALL JVMs (NON-BLOCKING)
+#############################
 
-for APP_SERVER in $APP_SERVER_LIST; do
-  echo "INFO: Starting $APP_SERVER..."
-  startServer "$APP_SERVER"
-
-  BATCH_LIST="$BATCH_LIST $APP_SERVER"
-  count=$((count + 1))
-
-  if [[ $count -ge $batch ]]; then
-    for JVM in $BATCH_LIST; do
-      TIME_USED=0
-      until serverStarted "$JVM" || [[ $TIME_USED -ge $START_TIMEOUT ]]; do
-        sleep 10
-        TIME_USED=$((TIME_USED + 10))
-      done
-
-      if ! serverStarted "$JVM"; then
-        echo "WARN: $JVM did not reach STARTED state"
-        ret=1
-      fi
-    done
-
-    BATCH_LIST=""
-    count=0
-  fi
+for APP_SERVER in $APP_SERVER_LIST
+do
+    echo "INFO: Starting $APP_SERVER..."
+    startServer "$APP_SERVER"
 done
 
-# ======================
-# FINAL STATUS CHECK
-# ======================
-echo "INFO: Final JVM status check..."
+#############################
+# FINAL STATUS CHECK (NON-BLOCKING)
+#############################
 
-for JVM in nodeagent $BATCH_LIST; do
-  if ! serverStarted "$JVM"; then
-    echo "WARN: $JVM not STARTED"
-    ret=1
-  fi
+echo "INFO: Checking JVM status..."
+
+for JVM in nodeagent $APP_SERVER_LIST
+do
+    if serverStarted "$JVM"; then
+        echo "OK: $JVM STARTED"
+    else
+        echo "WARN: $JVM still starting or not STARTED yet"
+        ret=1
+    fi
 done
 
 echo "INFO: startWebSphere.sh completed on $(hostname)"
