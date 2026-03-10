@@ -1,5 +1,13 @@
-Fatal (UNEXPECTED_MESSAGE): java.net.SocketException: Connection reset (
-"throwable"
-(CERTIFICATE_UNKNOWN): com.ibm.jsse2.util.j: PKIX path building failed: com.ibm.security.cert.IBMCertPathBuilderException: unable to find valid certification path to requested target (
-"throwable" : {
-  com.ibm.jsse2.util.j: PKIX path building failed: com.ibm.security.cert.IBMCertPathBuilderException: unable to find valid certification path to requested target
+[10/Mar/2026:11:20:55.00721] 0008a9fc b45ff640 - ERROR: lib_stream: openStream: Failed in r_gsk_secure_soc_init to fdl-dds-z1n-fit-wsn1.nit.frb.org:9452 : GSK_ERROR_BAD_CERT(gsk rc = 414)
+[10/Mar/2026:11:20:55.00726] 0008a9fc b45ff640 - ERROR: Missing, invalid, or expired certificate in certificate chain for server fdl-dds-z1n-fit-wsn1.nit.frb.org:9452 GSKVAL_ERROR_NO_CHAIN_BUILT (575010)
+[10/Mar/2026:11:20:55.00728] 0008a9fc b45ff640 - ERROR: Last validation error [575010]: GSKVAL_ERROR_NO_CHAIN_BUILT
+[10/Mar/2026:11:20:55.00729] 0008a9fc b45ff640 - ERROR: Subject [[Class=]GSKVALMethod::X509[Issuer=]CN=FR Enterprise Issuing CA - Infrastructure1,OU=PKI Services,O=FRB,C=US[#=]650205df[Subject=]CN=nit-was-crso-dev,OU=fras,O=frb,C=us[Class=]GSKVALMethod::PKIX[Issuer=]CN=FR Enterprise Issuing CA - Infrastructure1,OU=PKI Services,O=FRB,C=US[#=]650205df[Subject=]CN=nit-was-crso-dev,OU=fras,O=frb,C=us] failed certificate validation
+[10/Mar/2026:11:20:55.00730] 0008a9fc b45ff640 - ERROR: X509 Certificate validation log: [[Class=]GSKVALMethod::X509[Time=]2026:3:10:11:20:55.6[buildChain=][Error=]GSKVAL_ERR_NO_CHAIN_BUILT[Info=]CN=FR Enterprise Issuing CA - Infrastructure1,OU=PKI Services,O=FRB,C=US[Cert=][Issuer=]CN=FR Enterprise Issuing CA - Infrastructure1,OU=PKI Services,O=FRB,C=US[#=]650205df[Subject=]CN=nit-was-crso-dev,OU=fras,O=frb,C=us[=Cert][=buildChain]^M
+[Class=]GSKVALMethod::PKIX[Time=]2026:3:10:11:20:55.7[buildChain=][Error=]GSKVAL_ERR_NO_CHAIN_BUILT[Info=]CN=FR Enterprise Issuing CA - Infrastructure1,OU=PKI Services,O=FRB,C=US[Cert=][Issuer=]CN=FR Enterprise Issuing CA - Infrastructure1,OU=PKI Services,O=FRB,C=US[#=]650205df[Subject=]CN=nit-was-crso-dev,OU=fras,O=frb,C=us[=Cert][=buildChain]^M
+]
+[10/Mar/2026:11:20:55.00732] 0008a9fc b45ff640 - ERROR: ws_common: websphereGetStream: Could not open stream to fdl-dds-z1n-fit-wsn1.nit.frb.org:9452
+[10/Mar/2026:11:20:55.00735] 0008a9fc b45ff640 - ERROR: ws_common: websphereExecute: Failed to create the stream
+[10/Mar/2026:11:20:55.00736] 0008a9fc b45ff640 - ERROR: ws_common: websphereHandleRequest: Failed to execute the transaction to 'node11_ddsConsoleServer1' on host 'fdl-dds-z1n-fit-wsn1.nit.frb.org:9452'; will try another one
+[10/Mar/2026:11:20:55.00737] 0008a9fc b45ff640 - ERROR: ws_common: websphereWriteRequestReadResponse: Failed to find an app server to handle this request.
+[10/Mar/2026:11:20:55.00738] 0008a9fc b45ff640 - ERROR: ws_common: websphereRequestHandler: Failed to find an app server to handle this request.
+[10/Mar/2026:11:20:55.00739] 0008a9fc b45ff640 - ERROR: [10.48.94.40://T1DDS/monitoring/NewTransSearch.html] ws_common: websphereHandleRequest: Failed to handle request rc=2
