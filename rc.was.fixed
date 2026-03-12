@@ -1,0 +1,2620 @@
+#!/bin/bash
+
+function checkRGParameters {
+   rgParams=""
+   for RESOURCE_GRP in `/usr/es/sbin/cluster/utilities/clmgr q rg | grep -i dmgr`
+   do
+      RG_PRIM_NODE=`/usr/es/sbin/cluster/utilities/clmgr q rg ${RESOURCE_GRP} | grep ^NODES= | awk -F"\"" '{print $2}' | awk '{print $1}'`
+      SERVICE_LABEL=`dzdo /usr/es/sbin/cluster/utilities/clmgr q rg ${RESOURCE_GRP} | grep SERVICE_LABEL | awk -F"\"" '{print $2}'`
+      svcLabel=${SERVICE_LABEL}:
+      ipPattern="IP address:"
+      ipAddr=`/usr/es/sbin/cluster/utilities/cllscf | sed '/'"${svcLabel}"'/,/'"${ipPattern}"'/!d;/'"${ipPattern}"'/q' | grep "${ipPattern}" | awk '{print $3}'`
+      svcDnsName=`nslookup $ipAddr | grep 'name =' | awk '{print $NF}' | awk -F"." '{print $1}'`
+      rgParam=$RESOURCE_GRP:$RG_PRIM_NODE:$svcDnsName
+      rgParams=`echo $rgParams" "$rgParam | sed 's/^\ //g' | sed 's/\ *$//g'`
+   done
+}   
+
+function checkPHAClusterState  {
+   
+   PHAClusterState=`lssrc -ls clstrmgrES | grep ST_STABLE | wc -l`
+   if [ $PHAClusterState -eq 0 ]
+   then
+      ClStateUP="false"
+      i=0
+      while [ "$ClStateUP" == "false" ]
+      do
+         sleep 15
+         PHAClusterState=`lssrc -ls clstrmgrES | grep ST_STABLE | wc -l`
+         if [ $PHAClusterState -eq 0 ]
+         then
+            i=`expr $i + 1`
+         else
+            ClStateUP="true"
+#            echo "Info: --- PowerHA Cluster is in STABLE state" | tee -a $LOGDIR/$LOGNAM
+         fi
+         if [ $i -gt 20 ]
+         then
+            echo "Error: --- Wait time for PowerHA cluster exceeded 5 min" | tee -a $LOGDIR/$LOGNAM
+            ClStateUP="true"
+         fi
+      done
+      if [ $PHAClusterState -eq 0 ]
+      then
+         echo "Error: --- PowerHA Cluster is not in STABLE state" | tee -a $LOGDIR/$LOGNAM
+         echo "Error: --- WebSphere PHA DMGR cannot be started/stopped on $HOST" | tee -a $LOGDIR/$LOGNAM
+         echo "Please contact OSS team" | tee -a $LOGDIR/$LOGNAM
+         echo "Exiting ..." | tee -a $LOGDIR/$LOGNAM
+         echo "Return code = 1" | tee -a $LOGDIR/$LOGNAM
+         exit 1
+      fi
+   fi
+}
+
+function checkRG {
+#set -x
+         #srvIndexXml=`find $WASDIR/profiles/node*/config/cells/ -name serverindex.xml | grep $dmgrProfile| head -1`
+         for rgParam in $rgParams
+         do
+            RESOURCE_GRP=`echo $rgParam | awk -F":" '{print $1}'`
+            RG_PRIM_NODE1=`echo $rgParam | awk -F":" '{print $2}'`
+            svcDnsName=`echo $rgParam | awk -F":" '{print $3}'`
+#            svcDnsName=$svcDnsName".fras.frb.org"
+            if grep -w "$svcDnsName" $srvIndexXml > /dev/null 2>&1
+            then
+               RESOURCE_GRP_FOUND=$RESOURCE_GRP
+               RG_PRIM_NODE=$RG_PRIM_NODE1
+               DMGRPHA="true"
+#               echo "Info: --- Resource Group $RESOURCE_GRP configured for WAS${VERSION} profile $dmgrProfile" | tee -a $LOGDIR/$LOGNAM
+#               echo "Info: --- Resource Group $RESOURCE_GRP Primary Node is ${RG_PRIM_NODE}" | tee -a $LOGDIR/$LOGNAM
+               if [ "$HOST" = "${RG_PRIM_NODE}" ]
+               then
+                  PHAPrimNode="true"
+               fi
+            fi
+         done
+         if [ "$RESOURCE_GRP_FOUND" = "" ]
+         then
+#            echo "Info: --- No resource group configured for $dmgrProfile" | tee -a $LOGDIR/$LOGNAM
+            DMGRPHA="false"
+         fi
+}
+
+
+function startRGforProfile {
+
+   dmgrProfile=$1
+   RESOURCE_GRP_FOUND=$2
+   RG_PRIM_NODE=$3
+
+   echo | tee -a $LOGDIR/$LOGNAM
+   echo "--------------------------------------------------------------------------" | tee -a $LOGDIR/$LOGNAM
+   RG_ONLINE=`/usr/es/sbin/cluster/utilities/clRGinfo -s | grep ONLINE | grep ${RESOURCE_GRP_FOUND}`
+   RG_ONLINE_HOST=`/usr/es/sbin/cluster/utilities/clRGinfo -s | grep ONLINE | grep ${RESOURCE_GRP_FOUND} | awk -F":" '{print $3}'`
+   if [ "${RG_ONLINE}" == "" ]
+   then
+      echo "Info: --- Starting Resource group ${RESOURCE_GRP_FOUND} for dmgr profile $dmgrProfile at `date +'%H:%M:%S'`" | tee -a $LOGDIR/$LOGNAM
+      echo "Info: --- Command: /usr/es/sbin/cluster/utilities/clRGmove -s 'false' -u -i -g ${RESOURCE_GRP_FOUND} -n ${RG_PRIM_NODE}" | tee -a $LOGDIR/$LOGNAM
+      /usr/es/sbin/cluster/utilities/clRGmove -s 'false' -u -i -g ${RESOURCE_GRP_FOUND} -n ${RG_PRIM_NODE}
+      sleep 60
+      RG_ONLINE=`/usr/es/sbin/cluster/utilities/clRGinfo -s | grep ONLINE | grep ${RESOURCE_GRP_FOUND}` RG_ONLINE_HOST=`/usr/es/sbin/cluster/utilities/clRGinfo -s | grep ONLINE | grep ${RESOURCE_GRP_FOUND} | awk -F":" '{print $3}'`
+      if [ "${RG_ONLINE}" == "" ]
+      then
+         RGStateOnline="false"
+         i=0
+         while [ "$RGStateOnline" == "false" ]
+         do
+            RG_ONLINE=`/usr/es/sbin/cluster/utilities/clRGinfo -s | grep ONLINE | grep ${RESOURCE_GRP_FOUND}`
+            RG_ONLINE_HOST=`/usr/es/sbin/cluster/utilities/clRGinfo -s | grep ONLINE | grep ${RESOURCE_GRP_FOUND} | awk -F":" '{print $3}'`
+            if [ "${RG_ONLINE}" != "" ]
+            then
+               echo "Info: --- Resource group ${RESOURCE_GRP_FOUND} for profile $dmgrProfile is ONLINE on ${RG_ONLINE_HOST} at `date +'%H:%M:%S'`" | tee -a $LOGDIR/$LOGNAM
+               RGStateOnline="true"
+            else
+               echo "Info: --- Resource group ${RESOURCE_GRP_FOUND} for profile $dmgrProfile is still coming UP on ${RG_PRIM_NODE} at `date +'%H:%M:%S'`" | tee -a $LOGDIR/$LOGNAM
+            fi
+            sleep 15
+            i=`expr $i + 1`
+            if [ $i -gt 60 ]
+            then
+                echo "Error: --- Wait time for to start ${RESOURCE_GRP_FOUND} for profile $dmgrProfile exceeded 15 min at `date +'%H:%M:%S'`" | tee -a $LOGDIR/$LOGNAM
+                echo "Error: --- Resource group ${RESOURCE_GRP_FOUND} for profile $dmgrProfile could not be STARTED" | tee -a $LOGDIR/$LOGNAM
+                echo "Please contact OSS team" | tee -a $LOGDIR/$LOGNAM    
+                echo "Return code = 1" | tee -a $LOGDIR/$LOGNAM
+                RGStateOnline="true"
+                exit 1
+            fi
+         done
+      else
+         echo "Info: --- Resource group ${RESOURCE_GRP_FOUND} for profile $dmgrProfile is ONLINE on ${RG_ONLINE_HOST} at `date +'%H:%M:%S'`" | tee -a $LOGDIR/$LOGNAM
+      fi
+      echo | tee -a $LOGDIR/$LOGNAM
+      echo "Info: --- Current status of resource group ${RESOURCE_GRP_FOUND}" | tee -a $LOGDIR/$LOGNAM
+      echo "===============================================================================" | tee -a $LOGDIR/$LOGNAM
+      /usr/es/sbin/cluster/utilities/clRGinfo -s | grep ${RESOURCE_GRP_FOUND} | awk -F":" '{print $1" "$2" "$3}' | tee -a $LOGDIR/$LOGNAM
+      echo | tee -a $LOGDIR/$LOGNAM
+   else
+      echo "Info: --- Resource group ${RESOURCE_GRP_FOUND} for profile $dmgrProfile is already ONLINE on ${RG_ONLINE_HOST} at `date +'%H:%M:%S'`" | tee -a $LOGDIR/$LOGNAM
+   fi
+
+}
+
+function stopRGforProfile {
+   dmgrProfile=$1
+   RESOURCE_GRP_FOUND=$2
+   RG_PRIM_NODE=$3
+
+   echo | tee -a $LOGDIR/$LOGNAM
+   echo "--------------------------------------------------------------------------" | tee -a $LOGDIR/$LOGNAM
+   RG_ONLINE=`/usr/es/sbin/cluster/utilities/clRGinfo -s | grep ONLINE | grep ${RESOURCE_GRP_FOUND}`
+   RG_ONLINE_HOST=`/usr/es/sbin/cluster/utilities/clRGinfo -s | grep ONLINE | grep ${RESOURCE_GRP_FOUND} | awk -F":" '{print $3}'`
+ 
+   if [ "${RG_ONLINE}" != "" ]
+   then
+      if [ "${HOST}" = "${RG_ONLINE_HOST}" ]
+      then
+         echo "Info: --- Stopping Resource group ${RESOURCE_GRP_FOUND} for dmgr profile $dmgrProfile on ${RG_ONLINE_HOST}" | tee -a $LOGDIR/$LOGNAM
+         echo "Info: --- Command: /usr/es/sbin/cluster/utilities/clRGmove -s 'false' -d -i -g ${RESOURCE_GRP_FOUND} -n ${RG_PRIM_NODE}" | tee -a $LOGDIR/$LOGNAM
+         /usr/es/sbin/cluster/utilities/clRGmove -s 'false' -d -i -g ${RESOURCE_GRP_FOUND} -n ${RG_ONLINE_HOST}
+         sleep 60
+         RG_ONLINE=`/usr/es/sbin/cluster/utilities/clRGinfo -s | grep ONLINE | grep ${RESOURCE_GRP_FOUND}`
+         
+         if [ "${RG_ONLINE}" != "" ]
+         then
+            RGStateOnline="true"
+            i=0
+            while [ "$RGStateOnline" == "true" ]
+            do
+               RG_ONLINE=`/usr/es/sbin/cluster/utilities/clRGinfo -s | grep ONLINE | grep ${RESOURCE_GRP_FOUND}`
+               if [ "${RG_ONLINE}" = "" ]
+               then
+                  echo "Info: --- Resource group ${RESOURCE_GRP_FOUND} for profile $dmgrProfile is OFFLINE " | tee -a $LOGDIR/$LOGNAM
+                  RGStateOnline="false"    
+               else
+                  echo "Info: --- Resource group ${RESOURCE_GRP_FOUND} for profile $dmgrProfile is still UP" | tee -a $LOGDIR/$LOGNAM
+                  RGStateOnline="true"    
+               fi
+               sleep 15
+               i=`expr $i + 1`
+               if [ $i -gt 60 ]
+               then
+                  echo "Error: --- Wait time for to stop ${RESOURCE_GRP_FOUND} for profile $dmgrProfile exceeded 15 min" | tee -a $LOGDIR/$LOGNAM
+                  echo "Error: --- Resource group ${RESOURCE_GRP_FOUND} for profile $dmgrProfile could not be STOPPED" | tee -a $LOGDIR/$LOGNAM
+                  echo "Please contact OSS team" | tee -a $LOGDIR/$LOGNAM
+                  RGStateOnline="true"
+               fi
+            done
+         else
+            echo | tee -a $LOGDIR/$LOGNAM
+            echo "Info: --- Current status of resource group ${RESOURCE_GRP_FOUND}" | tee -a $LOGDIR/$LOGNAM
+            /usr/es/sbin/cluster/utilities/clRGinfo -s | grep ${RESOURCE_GRP_FOUND} | awk -F":" '{print $1" "$2" "$3}' | tee -a $LOGDIR/$LOGNAM
+            echo | tee -a $LOGDIR/$LOGNAM
+         fi
+      fi
+   else
+      echo "Info: --- Resource group ${RESOURCE_GRP_FOUND} for profile $dmgrProfile is already STOPPED" | tee -a $LOGDIR/$LOGNAM
+   fi
+
+}
+
+function checkStartDMGRProcessPHA {
+#set -x
+   dmgrProfile=$1
+   RESOURCE_GRP_FOUND=$2
+   RG_PRIM_NODE=$3
+   echo | tee -a $LOGDIR/$LOGNAM
+   echo "--------------------------------------------------------------------------" | tee -a $LOGDIR/$LOGNAM
+   if [ "${HOST}" = "${RG_ONLINE_HOST}" ]
+   then
+      echo "Info: --- Checking DMGR $dmgrProfile process on ${RG_ONLINE_HOST} at `date +'%H:%M:%S'`" | tee -a $LOGDIR/$LOGNAM
+      echo | tee -a $LOGDIR/$LOGNAM
+      PROFILEPATH=/shared/WebSphere/profiles/$dmgrProfile
+      echo "Info: --- PowerHA DMGR $dmgrProfile profile path $PROFILEPATH" | tee -a $LOGDIR/$LOGNAM
+      dmgrPid=`ps -ef|grep $PROFILEPATH | grep dmgr | egrep -vi "grep|patrolws" | awk '{print $2}'`
+      if [ "$dmgrPid" = "" ]
+      then
+         echo "Error: --- DMGR $dmgrProfile startup was not initiated by PowerHA" | tee -a $LOGDIR/$LOGNAM
+         echo "Error: --- Please contact MW Support" | tee -a $LOGDIR/$LOGNAM
+         echo "Return code = 1" | tee -a $LOGDIR/$LOGNAM
+         exit 1
+      fi
+      dmgrPidCnt=`ps -ef|grep $PROFILEPATH | grep dmgr | egrep -vi "grep|patrolws" | awk '{print $2}' | wc -l`
+      dmgrLauncherCnt=`ps -ef|grep $PROFILEPATH | grep dmgr | grep com.ibm.ws.management.tools.WsServerLauncher | egrep -vi "grep|patrolws" | awk '{print $2}' | wc -l`
+      if [ $dmgrPidCnt -gt 1 ] || [ $dmgrLauncherCnt -gt 0 ]
+      then
+         echo "Info: --- PowerHA DMGR $dmgrProfile is still STARTING on $RG_ONLINE_HOST at `date +'%H:%M:%S'`" | tee -a $LOGDIR/$LOGNAM
+         i=0
+         dmgrStillStarting="true"
+         while [ "$dmgrStillStarting" == "true" ]
+         do
+            sleep 15
+            i=`expr $i + 1`
+            dmgrPidCnt=`ps -ef|grep $PROFILEPATH | grep dmgr | egrep -vi "grep|patrolws" | awk '{print $2}' | wc -l`
+            dmgrLauncherCnt=`ps -ef|grep $PROFILEPATH | grep dmgr | grep com.ibm.ws.management.tools.WsServerLauncher | egrep -vi "grep|patrolws" | awk '{print $2}' | wc -l`
+            if [ $dmgrPidCnt -gt 1 ] || [ $dmgrLauncherCnt -gt 0 ]
+            then
+               dmgrStillStarting="true"
+               echo "Info: --- PowerHA DMGR $dmgrProfile is still STARTING on $RG_ONLINE_HOST at `date +'%H:%M:%S'`" | tee -a $LOGDIR/$LOGNAM
+            else
+               dmgrPid=`ps -ef|grep $PROFILEPATH | grep dmgr | grep com.ibm.ws.runtime.WsServer | egrep -vi "grep|patrolws" | awk '{print $2}'`
+               dmgrStillStarting="false"
+               echo "Info: --- PowerHA DMGR $dmgrProfile started with pid=$dmgrPid at `date +'%H:%M:%S'`" | tee -a $LOGDIR/$LOGNAM
+            fi
+            if [ $i -gt 60 ]
+            then
+               echo "Error: --- PowerHA DMGR $dmgrProfile COULD NOT BE STARTED on $RG_ONLINE_HOST during 15 min" | tee -a $LOGDIR/$LOGNAM
+               echo "Error: --- Please contact MW Support" | tee -a $LOGDIR/$LOGNAM
+               echo "Return code = 1" | tee -a $LOGDIR/$LOGNAM
+               dmgrStillStarting="false"
+               exit 1
+            fi
+         done
+      fi
+      dmgrPid=`ps -ef|grep $PROFILEPATH | grep dmgr | grep com.ibm.ws.runtime.WsServer | egrep -vi "grep|patrolws" | awk '{print $2}'`
+      if [ "$dmgrPid" != "" ]
+      then
+         echo "Info: --- PowerHA DMGR $dmgrProfile is running on $RG_ONLINE_HOST with pid = $dmgrPid at `date +'%H:%M:%S'`" | tee -a $LOGDIR/$LOGNAM
+      else
+         echo "Error: --- PowerHA DMGR $dmgrProfile is NOT running on $RG_ONLINE_HOST at `date +'%H:%M:%S'`" | tee -a $LOGDIR/$LOGNAM
+         echo "Error: --- Please contact MW Support" | tee -a $LOGDIR/$LOGNAM
+         echo "Return code = 1" | tee -a $LOGDIR/$LOGNAM
+         exit 1
+      fi
+   else
+      echo "Info: --- PowerHA DMGR $dmgrProfile is not configured to run on $HOST" | tee -a $LOGDIR/$LOGNAM
+   fi           
+}
+
+function checkStopDMGRProcessPHA {
+   dmgrProfile=$1
+   RESOURCE_GRP_FOUND=$2
+   RG_PRIM_NODE=$3
+
+   echo | tee -a $LOGDIR/$LOGNAM
+   echo "--------------------------------------------------------------------------" | tee -a $LOGDIR/$LOGNAM
+   echo "Info: --- Checking DMGR $dmgrProfile process state" | tee -a $LOGDIR/$LOGNAM
+   echo | tee -a $LOGDIR/$LOGNAM
+   PROFILEPATH=/shared/WebSphere/profiles/$dmgrProfile
+   echo "Info: --- PowerHA Primary node for ${RESOURCE_GRP_FOUND}: ${RG_PRIM_NODE}" | tee -a $LOGDIR/$LOGNAM
+   RG_ONLINE=`/usr/es/sbin/cluster/utilities/clRGinfo -s | grep ONLINE | grep ${RESOURCE_GRP_FOUND}`
+   RG_ONLINE_HOST=`/usr/es/sbin/cluster/utilities/clRGinfo -s | grep ONLINE | grep ${RESOURCE_GRP_FOUND} | awk -F":" '{print $3}'`
+   if [ "${RG_ONLINE}" = "" ]
+   then
+      echo "Info: --- PowerHA RG ${RESOURCE_GRP_FOUND} is OFFLINE" | tee -a $LOGDIR/$LOGNAM
+   else
+      echo "Info: --- PowerHA RG ${RESOURCE_GRP_FOUND} is ONLINE on ${RG_ONLINE_HOST}" | tee -a $LOGDIR/$LOGNAM
+   fi
+   if [ "$HOST" = "${RG_PRIM_NODE}" ]
+   then
+      dmgrPid=`ps -ef|grep $PROFILEPATH | grep dmgr | grep com.ibm.ws.runtime.WsServer | egrep -vi "grep|patrolws" | awk '{print $2}'`
+      if [ "$dmgrPid" != "" ]
+      then
+         echo "Info: --- DMGR $dmgrProfile is running on $HOST with PID $dmgrPid"| tee -a $LOGDIR/$LOGNAM
+      else
+         echo "Info: --- DMGR $dmgrProfile process is down on $HOST" | tee -a $LOGDIR/$LOGNAM
+      fi
+   fi
+   ProfilePid=`ps -ef|grep $PROFILEPATH | egrep -vi "grep|patrolws" | awk '{print $2}'`
+   if [[ -n $ProfilePid ]]
+   then
+      echo "Info: --- Some processes for $PROFILEPATH are still running. Killing them" | tee -a $LOGDIR/$LOGNAM
+      for pid in $ProfilePid
+      do
+         kill -9 $pid > /dev/null 2>&1
+      done
+   fi
+}
+
+
+function stopJvms {
+#stopJvms $WASDIR $cell $NODE_PROFILEPATH $profile $userId $jvmRule
+#set -x
+   WASDIR=$1
+   cell=$2
+   NODE_PROFILEPATH=$3
+   NODE_NAME=$4
+   profileName=$5
+   userId=$6
+   jvmRule=$7
+   jvmName=$8
+ 
+   MON_POLICY="false"
+   NODE_RESTART="false"
+   SECONDS=0
+   stopSecs=0
+   excludeProcess="nodeagent|ihs"
+   if [ "$jvmRule" = "jvm" ]
+   then
+      JVMLIST=$jvmName
+   else
+      JVMLIST=`ls -1 $NODE_PROFILEPATH/config/cells/$cell/nodes/${NODE_NAME}/servers | egrep -v $excludeProcess`
+   fi
+   if [ "$JVMLIST" == "" ]
+   then
+      echo "Info: --- No JVMs defined for profile $profileName" | tee -a $LOGDIR/$LOGNAM
+      return
+   else
+      for JVM in $JVMLIST
+      do
+         MON_POLICY=`cat $NODE_PROFILEPATH/config/cells/$cell/nodes/${NODE_NAME}/servers/$JVM/server.xml | grep "<monitoringPolicy xmi" | awk -F"autoRestart=" '{print $2}' | awk -F"\"" '{print $2}'`
+         if [ "${MON_POLICY}" = "true" ]
+         then
+            NODE_RESTART="true"
+         fi
+      done
+      echo | tee -a $LOGDIR/$LOGNAM
+      echo "-------------------------------------------------------------------------------" | tee -a $LOGDIR/$LOGNAM
+      echo "Info: --- Stopping jvm(s) for profile $profileName at `date +'%H:%M:%S'`" | tee -a $LOGDIR/$LOGNAM
+      echo "-------------------------------------------------------------------------------" | tee -a $LOGDIR/$LOGNAM
+      echo | tee -a $LOGDIR/$LOGNAM
+      for JVM in $JVMLIST
+      do
+          echo "Info: --- Stopping $JVM for profile $profileName" | tee -a $LOGDIR/$LOGNAM
+          PROC=`ps -ef | grep -v grep | grep $NODE_PROFILEPATH | grep " $JVM$" | grep com.ibm.ws.runtime.WsServer | grep -v startServer.sh | grep -v stopServer.sh | awk ' { print $2 }'`
+          if [[ "$PROC" != "" ]]
+          then
+             echo "Info: --- Command: su - $userId -c $NODE_PROFILEPATH/bin/stopServer.sh $JVM" | tee -a $LOGDIR/$LOGNAM
+             su - $userId -c "$NODE_PROFILEPATH/bin/stopServer.sh $JVM" | grep $JVM | grep completed &
+             sleep 2
+          else
+             echo "Info: --- $JVM is already stopped for profile $profileName" | tee -a $LOGDIR/$LOGNAM
+          fi
+      done
+      if [ "$jvmRule" = "jvm" ]
+      then
+         PSEXIST=`ps -ef | grep $NODE_PROFILEPATH | egrep -vi "grep|patrolws|rc.was|dmgr|nodeagent" | grep " $jvmName$" | awk '{print $2}'`
+      else
+         PSEXIST=`ps -ef | grep $NODE_PROFILEPATH | egrep -vi "grep|patrolws|rc.was|dmgr|nodeagent" | awk '{print $2}'`
+      fi
+      if [[ $PSEXIST != "" ]]
+      then
+         i=0
+         stopped="false"
+         while [ "$stopped" = "false" ]
+         do
+            sleep 15
+            if [ "$jvmRule" = "jvm" ]
+            then
+               PSEXIST=`ps -ef | grep $NODE_PROFILEPATH | egrep -vi "grep|patrolws|rc.was|dmgr|nodeagent" | grep " $jvmName$" | awk '{print $2}'`
+            else
+               PSEXIST=`ps -ef | grep $NODE_PROFILEPATH | egrep -vi "grep|patrolws|rc.was|dmgr|nodeagent" | awk '{print $2}'`
+            fi
+            if [[ $PSEXIST != "" ]]
+            then
+               i=`expr $i + 1`
+            else
+               stopped="true"
+            fi
+            if [ $i -gt 20 ]
+            then
+               if [ "$jvmRule" = "jvm" ]
+               then
+                  echo "Info: --- process for jvm $jvmName is hanging after 5 min. Killing it" | tee -a $LOGDIR/$LOGNAM
+               else
+                  echo "Info: --- Some WebSphere processes for profile $profileName are still hanging after 5 min. Killing them..." | tee -a $LOGDIR/$LOGNAM
+               fi
+               if [ "${NODE_RESTART}" = "true" ]
+               then
+                  stopNode $WASDIR $cell $NODE_PROFILEPATH $NODE_NAME $profile $userId $jvmRule
+                  echo "Info: --- Processes are: $PSEXIST" | tee -a $LOGDIR/$LOGNAM
+                  for pid in $PSEXIST
+                  do
+                      kill -9 $pid > /dev/null 2>&1
+                  done
+                  startNode $WASDIR $cell $NODE_PROFILEPATH $NODE_NAME $profile $userId $jvmRule
+               else
+                  echo "Info: --- Processes are: $PSEXIST" | tee -a $LOGDIR/$LOGNAM
+                  for pid in $PSEXIST
+                  do
+                     kill -9 $pid > /dev/null 2>&1
+                     echo "Info: --- Killing pid = $pid" | tee -a $LOGDIR/$LOGNAM
+                  done
+               fi
+               stopped="true"
+            fi
+         done
+      fi
+   fi
+   if [ "$jvmRule" = "jvm" ]
+   then
+      return
+   fi
+
+   PSEXIST=`ps -ef | grep $NODE_PROFILEPATH | egrep -vi "grep|patrolws|rc.was|dmgr|nodeagent" | awk '{print $2}'`
+   if [[ $PSEXIST != "" ]]
+   then
+      echo "Error: --- Some jvm processes are still running for profile $profileName" | tee -a $LOGDIR/$LOGNAMo
+      echo "Info: --- Please contact MW Support" | tee -a $LOGDIR/$LOGNAM
+      ret=1
+      return
+   else
+      echo | tee -a $LOGDIR/$LOGNAM
+      echo "Info: --- No jvm processes are running for cell $cell" | tee -a $LOGDIR/$LOGNAM
+   fi
+   stopSecs=$SECONDS
+   echo | tee -a $LOGDIR/$LOGNAM
+   echo "Info: --- Total time spent to stop All JVMs for cell $cell : $(($stopSecs/60))min $(($stopSecs%60))sec " | tee -a $LOGDIR/$LOGNAM
+   echo "All JVM processes are STOPPED at `date +'%H:%M:%S'`" | tee -a $LOGDIR/$LOGNAM
+   echo "-------------------------------------------------------------------------------" | tee -a $LOGDIR/$LOGNAM
+   echo "" | tee -a $LOGDIR/$LOGNAM
+}
+
+
+function startDMGR {
+
+   WASDIR=$1
+   dmgrProfile=$2
+   dmgrProfilePath=$3
+   userId=$4
+   if [ "$jvmRule" = "steadystate" ]
+   then
+      if cat $JVM_STATE_SS | grep $dmgrProfilePath > /dev/null 2>&1
+      then
+         echo "--------------------------------------------------------------------------" | tee -a $LOGDIR/$LOGNAM
+         echo "Info: --- DMGR $dmgrProfile exists in $JVM_STATE_SS file" | tee -a $LOGDIR/$LOGNAM
+         echo "--------------------------------------------------------------------------" | tee -a $LOGDIR/$LOGNAM
+         dmgrState=`cat $JVM_STATE_SS | grep $dmgrProfilePath | awk '{print $3}'`
+         if [ "$dmgrState" = "DOWN" ]
+         then
+            echo "Info: --- DMGR $dmgrProfile will not be started. Steady state is DOWN" | tee -a $LOGDIR/$LOGNAM
+            return
+         fi
+      else
+         echo "--------------------------------------------------------------------------" | tee -a $LOGDIR/$LOGNAM
+         echo "Error: --- DMGR $dmgrProfile is not in $JVM_STATE_SS file" | tee -a $LOGDIR/$LOGNAM
+         echo "--------------------------------------------------------------------------" | tee -a $LOGDIR/$LOGNAM
+         return
+      fi
+   fi
+   if [ "$jvmRule" = "laststop" ]
+   then
+      if cat $JVM_STATE | grep $dmgrProfilePath > /dev/null 2>&1
+      then
+         echo "--------------------------------------------------------------------------" | tee -a $LOGDIR/$LOGNAM
+         echo "Info: --- DMGR $dmgrProfile exists in $JVM_STATE file" | tee -a $LOGDIR/$LOGNAM
+         echo "--------------------------------------------------------------------------" | tee -a $LOGDIR/$LOGNAM
+         dmgrState=`cat $JVM_STATE | grep $dmgrProfilePath | awk '{print $3}'`
+         if [ "$dmgrState" = "DOWN" ]
+         then
+            echo "Info: --- DMGR $dmgrProfile will not be started. Last stop state is DOWN" | tee -a $LOGDIR/$LOGNAM
+            return
+         fi
+      else
+         echo "--------------------------------------------------------------------------" | tee -a $LOGDIR/$LOGNAM
+         echo "Error: --- DMGR $dmgrProfile is not in $JVM_STATE file" | tee -a $LOGDIR/$LOGNAM
+         echo "--------------------------------------------------------------------------" | tee -a $LOGDIR/$LOGNAM
+         return
+      fi
+   fi
+   dmgrProfile1=`cat $WASDIR/properties/profileRegistry.xml | grep "<profile isAReservationTicket" | awk -F"name=\"" '{print $2}' | awk -F"\"" '{print $1}' | grep $dmgrProfile`
+   if [ "$dmgrProfile1" = "" ]
+   then
+      echo "--------------------------------------------------------------------------" | tee -a $LOGDIR/$LOGNAM
+      echo "Info: --- There is no DMGR profile configured on $HOST" | tee -a $LOGDIR/$LOGNAM
+      echo "--------------------------------------------------------------------------" | tee -a $LOGDIR/$LOGNAM
+      return
+   else
+      echo | tee -a $LOGDIR/$LOGNAM
+      echo "-------------------------------------------------------------------------------" | tee -a $LOGDIR/$LOGNAM
+      echo "Info: --- Starting DMGR $dmgrProfile for WAS_ROOT = $WASDIR at `date +'%H:%M:%S'`" | tee -a $LOGDIR/$LOGNAM
+      echo "-------------------------------------------------------------------------------" | tee -a $LOGDIR/$LOGNAM
+      echo | tee -a $LOGDIR/$LOGNAM
+      PROFILEPATH=`cat $WASDIR/properties/profileRegistry.xml | grep "<profile isAReservationTicket" | grep $dmgrProfile |  awk -F"path=\"" '{print $2}' | awk -F"\"" '{print $1}'`
+      echo "Info: --- DMGR profile PATH for $dmgrProfile: $PROFILEPATH" | tee -a $LOGDIR/$LOGNAM
+      dmgrPid=`ps -ef|grep $PROFILEPATH | grep dmgr | grep com.ibm.ws.runtime.WsServer | egrep -vi "grep|patrolws" | awk '{print $2}'`
+      if [ "$dmgrPid" = "" ]
+      then
+         echo "Info: --- Starting dmgr for profile $dmgrProfile on host $HOST at `date +'%H:%M:%S'`" | tee -a $LOGDIR/$LOGNAM
+         echo "Info: --- Command: su - $userId -c $PROFILEPATH/bin/startManager.sh" | tee -a $LOGDIR/$LOGNAM
+         su - $userId -c "$PROFILEPATH/bin/startManager.sh" >> /tmp/start.dmgr.$dmgrProfile.$$ &
+         profileStarted="false"
+         i=0
+         while [ "$profileStarted" = "false" ]
+         do
+            sleep 15
+            if grep e-business /tmp/start.dmgr.$dmgrProfile.$$ > /dev/null 2>&1
+            then
+               profileStarted="true"
+               echo "Info: --- DMGR for profile $dmgrProfile started successfully at `date +'%H:%M:%S'`" | tee -a $LOGDIR/$LOGNAM
+               rm /tmp/start.dmgr.$dmgrProfile.$$
+            else
+               echo "Info: --- DMGR for profile $dmgrProfile is still starting at `date +'%H:%M:%S'`" | tee -a $LOGDIR/$LOGNAM
+               i=`expr $i + 1`
+            fi
+            if [ $i -gt 20 ]
+            then
+               echo "Error: --- DMGR for profile $dmgrProfile cannot be started within 5 min" | tee -a $LOGDIR/$LOGNAM
+               echo "Please contact MW support" | tee -a $LOGDIR/$LOGNAM
+               echo "Return code = 1" | tee -a $LOGDIR/$LOGNAM
+               exit 1
+            fi
+         done
+      else
+            echo "Info: --- DMGR profile $dmgrProfile is already running with pid=$dmgrPid" | tee -a $LOGDIR/$LOGNAM
+      fi
+   fi
+
+}
+
+function startNodeProfiles {
+#set -x
+   WASDIR=$1
+   cell=$2
+   NODE_PROFILES=$3
+   userId=$4
+   jvmRule=$5
+   SECONDS=0
+   egrep_NODE_PROFILES=`echo $NODE_PROFILES | sed 's/;/\|/g'`
+
+   case $jvmRule in
+
+      all|jvmsonly|nojvms)
+         profiles=`echo $NODE_PROFILES | sed 's/;/\ /g'`
+      ;;
+      laststop)
+         profiles=`cat $JVM_STATE | grep $WASDIR |grep nodeagent | egrep "$egrep_NODE_PROFILES" | awk '{print $1}' | awk -F"/" '{print $NF}'`
+      ;;
+      steadystate)
+         profiles=`cat $JVM_STATE_SS | grep $WASDIR | grep nodeagent | egrep "$egrep_NODE_PROFILES" | awk '{print $1}' | awk -F"/" '{print $NF}'`
+      ;;
+   esac
+
+   if [ "$profiles" = "" ]
+   then
+      echo "Error: --- Node profiles cannot be started for cell $cell on `hostname`" | tee -a $LOGDIR/$LOGNAM
+      return
+   fi
+   for profile in $profiles
+   do
+      NODE_PROFILEPATH=`cat $WASDIR/properties/profileRegistry.xml | grep "<profile isAReservationTicket" | grep $profile |  awk -F"path=\"" '{print $2}' | awk -F"\"" '{print $1}'`
+      NODE_NAME=`find $NODE_PROFILEPATH/config/cells/$cell/nodes/*[Nn]*/servers/nodeagent -name server.xml | awk -F"/" '{print $(NF-3)}'`
+      
+      startNode $WASDIR $cell $NODE_PROFILEPATH $NODE_NAME $profile $userId $jvmRule
+      if [ "$jvmRule" != "nojvms" ]
+      then
+         jvmName=""
+         startJvms $WASDIR $cell $NODE_PROFILEPATH $NODE_NAME $profile $userId $jvmRule $jvmName
+      fi
+      profileStartSecs=$SECONDS
+      echo "Info: --- Total time spent to start WebSphere processes for profile $profileName : $(($profileStartSecs/60))min $(($profileStartSecs%60))sec " | tee -a $LOGDIR/$LOGNAM
+      echo | tee -a $LOGDIR/$LOGNAM
+      echo "-------------------------------------------------------------------------------" | tee -a $LOGDIR/$LOGNAM
+      echo | tee -a $LOGDIR/$LOGNAM
+   done
+
+}
+
+function startNode {
+#set -x
+   WASDIR=$1
+   cell=$2
+   NODE_PROFILEPATH=$3
+   NODE_NAME=$4
+   profile=$5
+   userId=$6
+   jvmRule=$7
+
+   nodeagentStartSec=0
+   echo | tee -a $LOGDIR/$LOGNAM
+   echo "-------------------------------------------------------------------------------" | tee -a $LOGDIR/$LOGNAM
+   echo "Info: --- Starting nodeagent for profile $profile at `date +'%H:%M:%S'`" | tee -a $LOGDIR/$LOGNAM
+   echo "Info: --- Profile name is: $profile" | tee -a $LOGDIR/$LOGNAM
+   echo "Info: --- Profile Path is: $NODE_PROFILEPATH" | tee -a $LOGDIR/$LOGNAM
+   echo | tee -a $LOGDIR/$LOGNAM
+   ProfileNApid=`ps -ef|grep $NODE_PROFILEPATH | grep nodeagent | grep com.ibm.ws.runtime.WsServer | egrep -vi "grep|patrolws" | awk '{print $2}'`
+   if [ "$ProfileNApid" != "" ]
+   then
+      echo "Info: --- Nodeagent for profile $profile already running with pid = $ProfileNApid at `date +'%H:%M:%S'`" | tee -a $LOGDIR/$LOGNAM
+   else
+      echo "Info: --- Cleaning classCache ..." | tee -a $LOGDIR/$LOGNAM
+      echo "Info: --- Cleaning temp directories" | tee -a $LOGDIR/$LOGNAM
+      userForTemp=`ls -ld $NODE_PROFILEPATH/temp | awk '{print $3}'`
+      groupForTemp=`ls -ld $NODE_PROFILEPATH/temp | awk '{print $4}'`
+      rm -rf $NODE_PROFILEPATH/temp $NODE_PROFILEPATH/wstemp
+      mkdir $NODE_PROFILEPATH/temp $NODE_PROFILEPATH/wstemp
+      chown ${userForTemp}:${groupForTemp} $NODE_PROFILEPATH/temp $NODE_PROFILEPATH/wstemp
+      chmod 775 $NODE_PROFILEPATH/temp $NODE_PROFILEPATH/wstemp
+      su - $userId -c "$NODE_PROFILEPATH/bin/clearClassCache.sh"
+      echo "Info: --- Starting nodeagent for profile $profile on host $HOST at `date +'%H:%M:%S'`" | tee -a $LOGDIR/$LOGNAM
+      echo "Info: --- Command: su - $userId -c $NODE_PROFILEPATH/bin/startNode.sh" | tee -a $LOGDIR/$LOGNAM
+      su - $userId -c "$NODE_PROFILEPATH/bin/startNode.sh" >> /tmp/start.nodeagent.$profile.$$ &
+      profileStarted="false"
+      i=0
+      while [ "$profileStarted" = "false" ]
+      do
+         sleep 15
+         if grep e-business /tmp/start.nodeagent.$profile.$$ > /dev/null 2>&1
+         then
+            profileStarted="true"
+            nodeagentStartSec=$SECONDS
+            echo "Info: --- Nodeagent for profile $profile started successfully at `date +'%H:%M:%S'`" | tee -a $LOGDIR/$LOGNAM
+            echo "Info: --- Total time spent to start nodeagent for profile $profile : $(($nodeagentStartSec/60))min $(($nodeagentStartSec%60))sec " | tee -a $LOGDIR/$LOGNAM
+            rm /tmp/start.nodeagent.$profile.$$
+         else
+            i=`expr $i + 1`
+            echo "Info: --- Nodeagent for profile $profile is still starting at `date +'%H:%M:%S'`" | tee -a $LOGDIR/$LOGNAM
+         fi
+         if [ $i -gt 60 ]
+         then
+            echo "Error: --- Nodeagent for profile $profile could not be started within 15 min" | tee -a $LOGDIR/$LOGNAM
+            echo "Please contact MW support" | tee -a $LOGDIR/$LOGNAM
+            echo "Return code = 1" | tee -a $LOGDIR/$LOGNAM
+            exit 1
+         fi
+      done
+   fi
+} 
+
+function startJvms {
+#set -x
+#echo "startJvms $WASDIR $cell $NODE_PROFILEPATH $profile $userId $jvmRule"
+# startJvms $WASDIR $cell $NODE_PROFILEPATH $NODE_NAME $profileName $userId $jvmRule $jvmName
+   WASDIR=$1
+   cell=$2
+   NODE_PROFILEPATH=$3
+   NODE_NAME=$4
+   profileName=$5
+   userId=$6
+   jvmRule=$7
+   jvmName=$8
+
+   startSecs=0
+   ret=0
+   excludeProcess="nodeagent|ihs"
+  
+   echo | tee -a $LOGDIR/$LOGNAM
+   echo "-------------------------------------------------------------------------------" | tee -a $LOGDIR/$LOGNAM 
+   echo "Info: --- Starting jvms for profile $profileName at `date +'%H:%M:%S'`" | tee -a $LOGDIR/$LOGNAM
+   echo "Info: --- Profile Path is: $NODE_PROFILEPATH" | tee -a $LOGDIR/$LOGNAM
+   echo "-------------------------------------------------------------------------------" | tee -a $LOGDIR/$LOGNAM
+   echo | tee -a $LOGDIR/$LOGNAM
+   excludeProcess="nodeagent|ihs"
+   ProfileNApid=`ps -ef|grep $NODE_PROFILEPATH | grep nodeagent | grep com.ibm.ws.runtime.WsServer | egrep -vi "grep|patrolws" | awk '{print $2}'`
+   JVMLIST=`ls -1 $NODE_PROFILEPATH/config/cells/$cell/nodes/${NODE_NAME}/servers | egrep -v $excludeProcess`
+   if [ "$JVMLIST" == "" ]
+   then
+      echo "Info: --- No JVMs defined for $profileName" | tee -a $LOGDIR/$LOGNAM
+      return
+   fi
+   case $jvmRule in
+
+      jvm)
+         jvmStartListAll=$jvmName
+      ;;
+      all)
+         jvmStartListAll=`ls -1 $NODE_PROFILEPATH/config/cells/$cell/nodes/${NODE_NAME}/servers | egrep -v $excludeProcess`
+      ;;
+      laststop)
+         jvmStartListAll=`cat $JVM_STATE | grep $NODE_PROFILEPATH | egrep -v "DOWN|IGNORE" | awk '{print $2}' | grep -v nodeagent`
+      ;;
+      steadystate|jvmsonly)
+         jvmStartListAll=`cat $JVM_STATE_SS | grep $NODE_PROFILEPATH |egrep -v "DOWN|IGNORE" | awk '{print $2}' | grep -v nodeagent`
+      ;;
+      *)
+         echo "Error: --- Wrong jvmRule parameter $jvmRule"
+         exit 1
+      ;;
+   esac
+   if [ "$jvmStartListAll" = "" ]
+   then
+      echo | tee -a $LOGDIR/$LOGNAM
+      echo "Info: --- No JVMs to start for $profileName"  | tee -a $LOGDIR/$LOGNAM
+      echo | tee -a $LOGDIR/$LOGNAM
+      echo "-------------------------------------------------------------------------------" | tee -a $LOGDIR/$LOGNAM
+      return
+   fi
+####################
+   if [ "$jvmRule" != "jvm" ]
+   then
+      echo | tee -a $LOGDIR/$LOGNAM
+      echo "Info: --- List of ALL JVMs for profile $profileName:" | tee -a $LOGDIR/$LOGNAM
+      echo | tee -a $LOGDIR/$LOGNAM
+
+      for j in $jvmStartListAll
+      do
+         echo "          $j" | tee -a $LOGDIR/$LOGNAM
+      done
+      echo | tee -a $LOGDIR/$LOGNAM
+      VariableXML=`ls -1 $NODE_PROFILEPATH/config/cells/$cell/nodes/${NODE_NAME}/variables.xml`
+      jvmStartOrder=`cat $VariableXML | grep jvmOrder | grep value | awk -F"value=" '{print $2}' | awk -F "\"" '{print $2}'`
+      if [ "$jvmStartOrder" != "" ]
+      then
+         echo "Info: --- JVM start order defined by jvmOrder WAS variable for profile $profileName:" | tee -a $LOGDIR/$LOGNAM
+         echo | tee -a $LOGDIR/$LOGNAM
+         echo "          $jvmStartOrder" | tee -a $LOGDIR/$LOGNAM
+         echo | tee -a $LOGDIR/$LOGNAM
+         jvmStartOrder=`echo $jvmStartOrder | sed 's/,/\ /g' | awk '{for (i=1;i<=NF;i++) if (!a[$i]++) printf("%s%s",$i,FS)}{printf("\n")}'`
+         jvmStartOrder2=""
+         for i in $jvmStartOrder
+         do
+            if echo $jvmStartListAll | grep -w $i > /dev/null 2>&1
+            then
+               jvmStartOrder2=$jvmStartOrder2" "$i 
+            else
+               echo "Info: --- JVM $i from jvmStartList is not present on profile $profileName" | tee -a $LOGDIR/$LOGNAM
+            fi
+         done
+         jvmStartOrder2=`echo "$jvmStartOrder2" | sed 's/\ *$//g' | sed 's/^\ *//g'`
+         jvmStartOrder=`echo $jvmStartOrder2 | sed 's/\ *$//g' | sed 's/^\ *//g' |  sed 's/\ /,/g'`
+      fi
+   
+      if [ "$jvmStartOrder" = "" ]
+      then 
+         echo "Info: --- JVM Order List : JVM Order List is empty for profile $profileName" | tee -a $LOGDIR/$LOGNAM
+         echo | tee -a $LOGDIR/$LOGNAM
+      else
+         jvmStartOrderList=`echo $jvmStartOrder | sed 's/\,/\ /g' | awk '{for (i=1;i<=NF;i++) if (!a[$i]++) printf("%s%s",$i,FS)}{printf("\n")}' | sed 's/\ *$//g' | sed 's/^\ *//g'`
+         jvmStartOrderList_exclude=`echo $jvmStartOrderList | sed 's/\ /|/g'`
+         excludeProcess=`echo "$excludeProcess|$jvmStartOrderList_exclude" | awk -F"|" '{for (i=1;i<=NF;i++) if (!a[$i]++) printf("%s%s",$i,FS)}{printf("\n")}' | sed 's/|*$//g' | sed 's/^|*//g'`
+         echo "Info: --- JVM Order List for profile $profileName:" | tee -a $LOGDIR/$LOGNAM
+         echo | tee -a $LOGDIR/$LOGNAM
+         for j in $jvmStartOrderList
+         do
+            echo "          $j"  | tee -a $LOGDIR/$LOGNAM
+         done
+         echo | tee -a $LOGDIR/$LOGNAM
+         for jvm in $jvmStartOrderList
+         do
+            echo "Info: --- Starting JVM $jvm for profile $profileName at `date +'%H:%M:%S'`" | tee -a $LOGDIR/$LOGNAM
+            PROC=`ps -ef | grep -v grep | grep $NODE_PROFILEPATH | grep " $jvm$" | grep -v startServer.sh | grep -v stopServer.sh | awk ' { print $2 }'`
+            if  [ "$PROC" != "" ]
+            then
+               echo "Info: --- JVM $jvm is already running for profile $profileName" with pid=$PROC | tee -a $LOGDIR/$LOGNAM
+            else
+               echo "Info: --- Command: su - $userId -c $NODE_PROFILEPATH/bin/startServer.sh $jvm"  | tee -a $LOGDIR/$LOGNAM
+               echo $SECONDS > /tmp/start.$jvm.$profileName.$$
+               su - $userId -c "$NODE_PROFILEPATH/bin/startServer.sh $jvm" >> /tmp/start.$jvm.$profileName.$$ &
+               sleep 3
+               echo "Info: --- checking Status for $jvm for profile $profileName" | tee -a $LOGDIR/$LOGNAM
+               started="false"
+               JVM_STARTUP_TIME=0
+               while [ "$started" = "false" ]
+               do
+                  sleep 15
+                  if grep e-business /tmp/start.$jvm.$profileName.$$ > /dev/null 2>&1
+                  then
+                     echo "Info: --- JVM $jvm for profile $profileName is started successfully at `date +'%H:%M:%S'`" | tee -a $LOGDIR/$LOGNAM
+                     startPoint=0
+                     startPoint=`head -1 /tmp/start.$jvm.$profileName.$$`
+                     JvmSecs=`expr $SECONDS - $startPoint`
+                     echo "Info: --- Time spent to start JVM $jvm for profile $profileName : $(($JvmSecs/60))min $(($JvmSecs%60))sec " | tee -a $LOGDIR/$LOGNAM
+                     rm /tmp/start.$jvm.$profileName.$$
+                     started="true"
+                  else
+                     JVM_STARTUP_TIME=`expr $JVM_STARTUP_TIME + 15`
+                  fi
+                  if [[ $JVM_STARTUP_TIME -gt $JVM_STARTUP_TIMEOUT ]]
+                  then
+                     echo | tee -a $LOGDIR/$LOGNAM
+                     echo "-------------------------------------------------------------------------------" | tee -a $LOGDIR/$LOGNAM
+                     echo "Error: --- JVM $jvm startup exceeded $JVM_STARTUP_TIMEOUT sec. Please check JVM logs for errors" | tee -a $LOGDIR/$LOGNAM
+                     echo | tee -a $LOGDIR/$LOGNAM
+                     started="true"
+                     echo | tee -a $LOGDIR/$LOGNAM
+                     cat /tmp/start.$jvm.$profileName.$$ >> $LOGDIR/$LOGNAM
+                     echo | tee -a $LOGDIR/$LOGNAM
+                     rm /tmp/start.$jvm.$profileName.$$
+                     echo "Return code=1"
+                     echo "-------------------------------------------------------------------------------" | tee -a $LOGDIR/$LOGNAM
+                     exit 1
+                  fi
+               done 
+            fi
+          done
+      fi
+      jvmDownList=`cat $VariableXML | grep jvmDown | grep value | awk -F"value=" '{print $2}' | awk -F "\"" '{print $2}'`
+      echo | tee -a $LOGDIR/$LOGNAM
+      if [ "$jvmDownList" == "" ]
+      then
+         echo "Info: --- JVM Down List : List is empty for profile $profileName" | tee -a $LOGDIR/$LOGNAM
+      else
+         echo "Info: --- JVM Down List defined by jvmDown WAS variable for profile $profileName:" | tee -a $LOGDIR/$LOGNAM
+         echo | tee -a $LOGDIR/$LOGNAM
+         echo "          $jvmDownList" | tee -a $LOGDIR/$LOGNAM
+         echo | tee -a $LOGDIR/$LOGNAM
+      fi
+      jvmDownList=`echo $jvmDownList | sed 's/\,/\ /g' | awk '{for (i=1;i<=NF;i++) if (!a[$i]++) printf("%s%s",$i,FS)}{printf("\n")}' | sed 's/\ *$//g' | sed 's/^\ *//g'`
+      #jvmDownList_exclude=`echo $jvmDownList | sed 's/\ /|/g'` 
+      jvmDownList_exclude=`echo $jvmDownList | sed 's/\ /|/g'` 
+      #excludeProcess=`echo "$excludeProcess|$jvmDownList_exclude" | awk -F"|" '{for (i=1;i<=NF;i++) if (!a[$i]++) printf("%s%s",$i,FS)}{printf("\n")}' | sed 's/\|*$//g' | sed 's/^\|*//g'`
+      excludeProcess=`echo "$excludeProcess|$jvmDownList_exclude" | awk -F"|" '{for (i=1;i<=NF;i++) if (!a[$i]++) printf("%s%s",$i,FS)}{printf("\n")}' | sed 's/|*$//g' | sed 's/^|*//g'`
+      echo "Info: --- Processes to exclude during startup for profile $profileName: $excludeProcess" | tee -a $LOGDIR/$LOGNAM
+fi
+####################
+   case $jvmRule in
+      jvm)
+         jvmStartList=$jvmName
+      ;;
+      all)
+         jvmStartList=`ls -1 $NODE_PROFILEPATH/config/cells/$cell/nodes/${NODE_NAME}/servers | egrep -v $excludeProcess`
+      ;;
+      laststop)
+         jvmStartList=`cat $JVM_STATE | grep $NODE_PROFILEPATH | awk '{print $2}' | egrep -v "DOWN|IGNORE" | grep -v nodeagent | egrep -v $excludeProcess`
+      ;;
+      steadystate|jvmsonly)
+         jvmStartList=`cat $JVM_STATE_SS | grep $NODE_PROFILEPATH | egrep -v "DOWN|IGNORE" | awk '{print $2}' | grep -v nodeagent | egrep -v $excludeProcess`
+      ;;
+      *)
+         echo "Error: --- Wrong jvmRule parameter $jvmRule"
+         exit 1
+      ;;
+   esac
+
+   if [ "$jvmStartList" == "" ]
+   then
+      echo "Info: --- JVM Start List is empty. No JVMs left to start" | tee -a $LOGDIR/$LOGNAM
+      return
+   fi
+   echo | tee -a $LOGDIR/$LOGNAM
+   echo "Info: --- JVM Start List for profile $profileName:"  | tee -a $LOGDIR/$LOGNAM
+   echo | tee -a $LOGDIR/$LOGNAM
+   for j in $jvmStartList
+   do
+      echo "          $j"  | tee -a $LOGDIR/$LOGNAM
+   done
+   echo | tee -a $LOGDIR/$LOGNAM
+   JVM_STARTING=0
+   for jvm in $jvmStartList
+   do
+      echo "Info: --- Starting JVM $jvm for profile $profileName at `date +'%H:%M:%S'`" | tee -a $LOGDIR/$LOGNAM
+      PROC=`ps -ef | grep -v grep | grep $NODE_PROFILEPATH | grep " $jvm$" | grep -v startServer.sh | grep -v stopServer.sh | awk ' { print $2 }'`
+      if  [ "$PROC" != "" ]
+      then
+         echo "Info: --- JVM $jvm for profile $profileName is already running" | tee -a $LOGDIR/$LOGNAM
+      else
+         echo "Info: --- Command: su - $userId -c $NODE_PROFILEPATH/bin/startServer.sh $jvm" | tee -a $LOGDIR/$LOGNAM
+         echo $SECONDS > /tmp/start.$jvm.$profileName.$$
+         su - $userId -c "$NODE_PROFILEPATH/bin/startServer.sh $jvm" >> /tmp/start.$jvm.$profileName.$$ &
+         JVM_STARTING=`expr $JVM_STARTING + 1`
+         sleep 3
+      fi
+   done
+
+   if [ $JVM_STARTING -gt 0 ]
+   then
+      NODE_STARTUP_TIME=0
+      ALL_STARTED="false"
+      while [ "$ALL_STARTED" = "false" ]
+      do
+         sleep 15
+          NUMBER_NOT_STARTED=`ls -l /tmp | grep $$ | grep start | grep $profileName | grep -v nodeagent | wc -l`
+          if [ $NUMBER_NOT_STARTED -eq 0 ]
+          then
+             echo "Info: --- All JVMs for profile $profileName are started successfully" | tee -a $LOGDIR/$LOGNAM
+             ALL_STARTED="true"
+          else
+             for i in `ls /tmp/start.*.$$`
+             do
+               jvm=`echo $i | awk -F"/" '{print $3}' | awk -F"." '{print $2}'`
+               if grep e-business /tmp/start.$jvm.$profileName.$$ > /dev/null 2>&1
+               then echo "Info: --- JVM $jvm for profile $profileName is started successfully at `date +'%H:%M:%S'`" | tee -a $LOGDIR/$LOGNAM
+                  startPoint=0
+                  startPoint=`head -1 /tmp/start.$jvm.$profileName.$$`
+                  JvmSecs=`expr $SECONDS - $startPoint`
+                  echo "Info: --- Time spent to start JVM $jvm for profile $profileName : $(($JvmSecs/60))min $(($JvmSecs%60))sec " | tee -a $LOGDIR/$LOGNAM
+                  NUMBER_NOT_STARTED=`expr $NUMBER_NOT_STARTED - 1`
+                  rm /tmp/start.$jvm.$profileName.$$
+               fi
+             done
+             NODE_STARTUP_TIME=`expr $NODE_STARTUP_TIME + 15`
+          fi
+          if [ $NODE_STARTUP_TIME -gt $NODE_START_TIMEOUT ]
+          then
+             ALL_STARTED="true"
+             ret=1
+          fi
+      done
+
+      if [ $ret -gt 0 ]
+      then
+         if ls /tmp/start.*.$profileName.$$ > /dev/null 2>&1
+         then
+            echo "ERROR: JVM(s) startup time for profile $profileName exceeded $NODE_START_TIMEOUT sec. Please contact OPS Middleware" | tee -a $LOGDIR/$LOGNAM
+            if [ "$jvmRule" = "jvm" ]
+            then
+               echo "ERROR: JVM $jvmName startup time exceeded $NODE_START_TIMEOUT sec. Please contact OPS Middleware" | tee -a $LOGDIR/$LOGNAM
+               exit 1
+            fi
+            echo "Info: --- List of JVMs FAILED to start within $NODE_START_TIMEOUT sec:" | tee -a $LOGDIR/$LOGNAM
+            for i in `ls /tmp/start.*.$profileName.$$`
+            do jvm=`echo $i | awk -F"/" '{print $3}' | awk -F"." '{print $2}'`
+               echo "-------------------------------------------------------------------------------" | tee -a $LOGDIR/$LOGNAM
+               echo "     $jvm" | tee -a $LOGDIR/$LOGNAM
+               echo "===================================" | tee -a $LOGDIR/$LOGNAM
+               cat /tmp/start.$jvm.$profileName.$$ >> $LOGDIR/$LOGNAM
+               echo "-------------------------------------------------------------------------------" | tee -a $LOGDIR/$LOGNAM
+            done
+         else
+            echo "WARNING: JVM(s) startup for profile $profileName exceeded $NODE_START_TIMEOUT sec. Please contact OPS Middleware" | tee -a $LOGDIR/$LOGNAM
+            if [ "$jvmRule" != "jvm" ] 
+            then
+               echo "Info: --- All JVMs for profile $profileName are started successfully "  | tee -a $LOGDIR/$LOGNAM
+            fi
+            ret=0
+         fi
+      fi
+   fi
+
+}
+
+
+function stopDMGR {
+
+   WASDIR=$1
+   dmgrProfile=$2
+   dmgrProfilePath=$3
+   userId=$4
+
+   dmgrProfile1=`cat $WASDIR/properties/profileRegistry.xml | grep "<profile isAReservationTicket" | awk -F"name=\"" '{print $2}' | awk -F"\"" '{print $1}' | grep $dmgrProfile`
+   if [ "$dmgrProfile1" = "" ]
+   then
+      echo "Info: --- There is no DMGR profile configured on $HOST" | tee -a $LOGDIR/$LOGNAM
+      return
+   else
+      echo | tee -a $LOGDIR/$LOGNAM
+      echo "-------------------------------------------------------------------------------" | tee -a $LOGDIR/$LOGNAM
+      echo "Info: --- Stopping DMGR $dmgrProfile for WAS_ROOT = $WASDIR at `date +'%H:%M:%S'`" | tee -a $LOGDIR/$LOGNAM
+      echo "-------------------------------------------------------------------------------" | tee -a $LOGDIR/$LOGNAM
+      echo | tee -a $LOGDIR/$LOGNAM
+      PROFILEPATH=`cat $WASDIR/properties/profileRegistry.xml | grep "<profile isAReservationTicket" | grep $dmgrProfile |  awk -F"path=\"" '{print $2}' | awk -F"\"" '{print $1}'`
+      dmgrPid=`ps -ef|grep $PROFILEPATH | grep dmgr | grep com.ibm.ws.runtime.WsServer | egrep -vi "grep|patrolws" | awk '{print $2}'`
+      if [[ -n $dmgrPid ]]
+      then
+         DMGR_STOPPED="false"
+         DMGR_STOP_TIME=0
+         echo | tee -a $LOGDIR/$LOGNAM
+         echo "Info: --- Stopping DMGR for profile $dmgrProfile ..." | tee -a $LOGDIR/$LOGNAM
+         echo "Info: --- Command: su - $userId -c $PROFILEPATH/bin/stopManager.sh "| tee -a $LOGDIR/$LOGNAM
+         su - $userId -c "$PROFILEPATH/bin/stopManager.sh" > /tmp/stop.dmgr.$dmgrProfile.$$ &
+         while [[ $DMGR_STOPPED != "true" && $DMGR_STOP_TIME -lt 90 ]]
+         do 
+            if grep "stop completed" /tmp/stop.dmgr.$dmgrProfile.$$ > /dev/null 2>&1
+            then
+               echo "Info: --- DMGR for profile $dmgrProfile stopped successfully at `date +'%H:%M:%S'`" | tee -a $LOGDIR/$LOGNAM
+               rm /tmp/stop.dmgr.$dmgrProfile.$$
+               DMGR_STOPPED="true"
+            fi
+            sleep 5
+            DMGR_STOP_TIME=`expr $DMGR_STOP_TIME + 5`
+         done
+
+         if [ "$DMGR_STOPPED" != "true" ]
+         then
+            dmgrPid=`ps -ef|grep $PROFILEPATH | grep dmgr | grep com.ibm.ws.runtime.WsServer |egrep -vi "grep|patrolws" | awk '{print $2}'`
+            if [[ -n $dmgrPid ]]
+            then
+               echo "Info: --- DMGR is still running. Killing it's PID now..." | tee -a $LOGDIR/$LOGNAM
+               for pid in $dmgrPid
+               do 
+                  echo "Info: --- killing dmgr PID $pid" | tee -a $LOGDIR/$LOGNAM
+                  kill -9 $pid > /dev/null 2>&1
+               done
+               rm /tmp/stop.dmgr.$dmgrProfile.$$
+               DMGR_STOPPED="true" 
+            fi
+            ProfilePid=`ps -ef|grep $PROFILEPATH | egrep -vi "grep|patrolws" | awk '{print $2}'`
+            if [[ -n $ProfilePid ]]
+            then
+               echo "Info: --- Some processes for $PROFILEPATH are still running. Killing them" | tee -a $LOGDIR/$LOGNAM
+               for pid in $ProfilePid
+               do
+                  kill -9 $pid > /dev/null 2>&1
+               done
+            fi
+         fi
+      else
+         echo "Info: --- DMGR for profile $dmgrProfile is already stopped" | tee -a $LOGDIR/$LOGNAM
+         DMGR_STOPPED="true"
+      fi
+   fi
+}
+
+function stopNodeProfiles {
+#set -x
+   WASDIR=$1
+   cell=$2
+   NODE_PROFILES=$3
+   userId=$4
+   jvmRule=$5
+   SECONDS=0
+
+   profiles=`echo $NODE_PROFILES | sed 's/;/\ /g'`
+
+   for profile in $profiles
+   do
+      NODE_PROFILEPATH=`cat $WASDIR/properties/profileRegistry.xml | grep "<profile isAReservationTicket" | grep $profile |  awk -F"path=\"" '{print $2}' | awk -F"\"" '{print $1}'`
+      if [ -f $NODE_PROFILEPATH/config/cells/$cell/nodes/*[Nn]*/servers/nodeagent/server.xml ]
+      then
+         NODE_NAME=`find $NODE_PROFILEPATH/config/cells/$cell/nodes/*[Nn]*/servers/nodeagent -name server.xml | awk -F"/" '{print $(NF-3)}'`
+      else
+         echo "Error: --- Wrong configuration for WAS cell $cell: "
+         echo "WASDIR = $WASDIR"
+         echo "Cell = $cell"
+         echo "Node Profile = $profile"
+         echo "NODE_PROFILEPATH = $NODE_PROFILEPATH"
+         exit 1
+      fi
+      if [ "$jvmRule" = "jvmsonly" ]
+      then
+         jvmName=""
+         stopJvms $WASDIR $cell $NODE_PROFILEPATH $NODE_NAME $profile $userId $jvmRule $jvmName
+      else
+         jvmName=""
+         stopJvms $WASDIR $cell $NODE_PROFILEPATH $NODE_NAME $profile $userId $jvmRule $jvmName
+         stopNode $WASDIR $cell $NODE_PROFILEPATH $NODE_NAME $profile $userId $jvmRule $jvmName
+      fi
+   done
+
+}
+
+function stopNode {
+#set -x
+   WASDIR=$1
+   cell=$2
+   NODE_PROFILEPATH=$3
+   NODE_NAME=$4
+   profile=$5
+   userId=$6
+   jvmRule=$7
+
+   echo | tee -a $LOGDIR/$LOGNAM
+   echo "-------------------------------------------------------------------------------" | tee -a $LOGDIR/$LOGNAM
+   echo "Info: --- Stopping nodeagent for profile $profile at `date +'%H:%M:%S'`" | tee -a $LOGDIR/$LOGNAM
+   echo "Info: --- Profile name is: $profile" | tee -a $LOGDIR/$LOGNAM
+   echo "Info: --- Profile Path is: $NODE_PROFILEPATH" | tee -a $LOGDIR/$LOGNAM
+   echo | tee -a $LOGDIR/$LOGNAM
+   ProfileNApid=`ps -ef|grep $NODE_PROFILEPATH | grep nodeagent | grep com.ibm.ws.runtime.WsServer | egrep -vi "grep|patrolws" | awk '{print $2}'`
+   if [ "$ProfileNApid" == "" ]
+   then
+      echo "Info: --- Nodeagent for profile $profile already stopped" | tee -a $LOGDIR/$LOGNAM
+   else
+      NODEAGENT_STOP_TIME=0
+      NODE_STOPPED="false"
+      echo | tee -a $LOGDIR/$LOGNAM
+      echo "Info: --- Stopping nodeagent for profile $profile at `date +'%H:%M:%S'`" | tee -a $LOGDIR/$LOGNAM
+      echo "Info: --- Command: su - $userId -c $NODE_PROFILEPATH/bin/stopNode.sh "| tee -a $LOGDIR/$LOGNAM
+      su - $userId -c "$NODE_PROFILEPATH/bin/stopNode.sh" >> /tmp/stop.nodeagent.$profile.$$ &
+      while [[ $NODE_STOPPED != "true" && $NODEAGENT_STOP_TIME -lt 90 ]]
+      do
+         if grep "stop completed" /tmp/stop.nodeagent.$profile.$$ > /dev/null 2>&1
+         then
+            echo "Info: --- nodeagent for profile $profile stopped successfully at `date +'%H:%M:%S'`" | tee -a $LOGDIR/$LOGNAM
+            rm /tmp/stop.nodeagent.$profile.$$
+            NODE_STOPPED="true"
+         fi
+         sleep 5
+         NODEAGENT_STOP_TIME=`expr $NODEAGENT_STOP_TIME + 5`
+      done
+   
+      if [[ "$NODE_STOPPED" != "true" ]]
+      then
+         ProfileNApid=`ps -ef|grep $NODE_PROFILEPATH | grep nodeagent | egrep -vi "grep|patrolws" | awk '{print $2}'`
+         if [[ -n $ProfileNApid ]]
+         then
+            echo "Info: --- nodeagent is still running. Killing it's PID now..." | tee -a $LOGDIR/$LOGNAM
+            for pid in $ProfileNApid
+            do
+               echo "Info: --- killing nodeagent PID $pid" | tee -a $LOGDIR/$LOGNAM
+               kill -9 $pid > /dev/null 2>&1
+            done
+            rm /tmp/stop.nodeagent.$PROFILE_NAME.$$
+            NODE_STOPPED="true"
+         fi
+     fi
+   fi  
+   ProfilePid=`ps -ef|grep $NODE_PROFILEPATH | egrep -vi "grep|patrolws" | awk '{print $2}'`
+   if [[ -n $ProfilePid ]]
+   then
+      echo "Info: --- Some processes for $NODE_PROFILEPATH are still running. Killing them" | tee -a $LOGDIR/$LOGNAM
+      for pid in $ProfilePid
+      do
+         echo "Info: --- Killing $pid" | tee -a $LOGDIR/$LOGNAM
+         process=`ps -ef | grep $pid`
+         echo "Info: --- Running process" | tee -a $LOGDIR/$LOGNAM
+         echo $process | tee -a $LOGDIR/$LOGNAM
+         echo | tee -a $LOGDIR/$LOGNAM
+         echo "--------------------" | tee -a $LOGDIR/$LOGNAM
+         echo | tee -a $LOGDIR/$LOGNAM
+         kill -9 $pid > /dev/null 2>&1
+      done
+   fi
+} 
+
+function collectWASInfo {
+   jvmSS=$1
+#echo "function collectWASInfo"
+   rm $WAS_CELLS $JVM_STATE $IHS_STATE $ECV_STATE > /dev/null 2>&1
+   touch $WAS_CELLS $JVM_STATE $IHS_STATE $ECV_STATE
+   chmod 644 $WAS_CELLS $JVM_STATE $IHS_STATE $ECV_STATE
+   chown wsadmin:wsadmin $WAS_CELLS $JVM_STATE $IHS_STATE $ECV_STATE
+   
+   PHA_PKG=`lslpp -LI cluster.es.server.rte 2>/dev/null | grep cluster.es.server.rte | awk '{if (index($3, "C")) print $0}'`
+   if [ "${PHA_PKG}" != "" ]
+   then
+      PHAClusterState=`lssrc -ls clstrmgrES | grep ST_STABLE | wc -l`
+      if [ $PHAClusterState -eq 0 ]
+      then
+         echo "Error: --- PowerHA Cluster is not in STABLE state" | tee -a $LOGDIR/$LOGNAM
+         echo "Please contact OSS team" | tee -a $LOGDIR/$LOGNAM
+         echo "Exiting ..." | tee -a $LOGDIR/$LOGNAM
+         echo "Return code = 1" | tee -a $LOGDIR/$LOGNAM
+         exit 1
+      fi
+   fi
+   if [ "${PHA_PKG}" != "" ] && [ -d /usr/es/sbin/cluster/utilities ] && [ $PHAClusterState -gt 0 ]
+   then
+      #RESOURCE_GRPS=`/usr/es/sbin/cluster/utilities/clmgr q rg | grep -i dmgr`
+      RESOURCE_GRPS=`/usr/es/sbin/cluster/utilities/clshowres | grep -i dmgr | grep "Resource Group Name" | awk '{print $NF}'`
+      if [ "${RESOURCE_GRPS}" != "" ]
+      then
+         PHA="true"
+         #echo "Info: --- PowerHA is installed on $HOST and in STABLE state"  
+         #echo "Info: --- Resource group(s) configured for WAS dmgr(s): " 
+         rgParams=""
+         for RESOURCE_GRP in $RESOURCE_GRPS
+         do
+            RG_PRIM_NODE=`/usr/es/sbin/cluster/utilities/clshowres -g $RESOURCE_GRP | grep "Participating Node Name(s)" | sed s/"Participating Node Name(s)"//g | sed s/^\ *//g | awk '{print $1}'` SERVICE_LABEL=`/usr/es/sbin/cluster/utilities/clshowres -g $RESOURCE_GRP | grep "Service IP Label" | awk '{print $NF}'`
+            SVC_IP=`/usr/es/sbin/cluster/utilities/cllsif | egrep "dmg|wsdm" | awk '{print $1" "$(NF-2)}' | sort -u | grep -w "$SERVICE_LABEL" | awk '{print $2}'`
+            SVC_DNS=`nslookup ${SVC_IP} | grep name | awk '{print $NF}' | sed 's/\.*$//g'`
+            rgParam=${RESOURCE_GRP}:${RG_PRIM_NODE}:${SVC_DNS}
+            rgParams=`echo $rgParams" "$rgParam | sed 's/^\ //g' | sed 's/\ *$//g'`
+         done
+      else
+         DMGRPHA="false"
+         PHA="false"
+         echo "   Info: --- NO Resource group(s) configured for WAS dmgr(s)" 
+      fi
+   else
+      PHA="false"
+      #echo "Info: --- PowerHA is not installed on $HOST" 
+   fi
+      
+   ls /[ou][ps][rt]/WebSphere/v[8-9][0-5] > /dev/null 2>&1
+   if [ $? -ne 0 ]
+   then
+      collectECVInfo
+      collectIHSInfo
+      return
+   fi
+   for WASDIR in `find /[ou][ps][rt]/WebSphere/v[8-9][0-5] -name security.xml | grep -i node | grep profiles/ | awk -F"/profiles" '{print $1}' | sort -u`
+   do
+      if [ -f $WASDIR/properties/profileRegistry.xml ]
+      then
+         if cat $WASDIR/properties/profileRegistry.xml | grep "$WASDIR/profiles" > /dev/null 2>&1
+         then
+            echo
+         else
+            echo "Error: WAS installation with wrong installation root $WASDIR"
+            break
+         fi
+      fi
+      
+      VERSION=`echo $WASDIR | awk -F"/" '{print $4}'`
+      if [ -f $WASDIR/properties/profileRegistry.xml ]
+      then
+         WASENV=''
+         user=`ls -l $WASDIR/properties/profileRegistry.xml | awk '{print $3}'`
+         for CELL_NAME in `find $WASDIR/profiles/*[Nn]*/config/cells -name cell.xml | awk -F"/" '{print $(NF-1)}' | sort -u`
+         do
+            #echo $CELL_NAME
+            NODE_PROFILES=""
+            for nodeProfile in `cat $WASDIR/properties/profileRegistry.xml | grep managed | grep "<profile isAReservationTicket" | awk -F"name=\"" '{print $2}' | awk -F"\"" '{print $1}'`
+            do
+               nodeProfilePath=`cat $WASDIR/properties/profileRegistry.xml | grep $nodeProfile | grep "<profile isAReservationTicket" | awk -F"path=\"" '{print $2}' | awk -F"\"" '{print $1}'`
+               CELL_NAME_N=`ls -1 $nodeProfilePath/config/cells/*/cell.xml | awk -F"/" '{print $(NF-1)}'`
+               if [ "$CELL_NAME" = "$CELL_NAME_N" ]
+               then
+                  NODE_PROFILES=`echo $NODE_PROFILES";"$nodeProfile| sed 's/\;*$//g' | sed 's/^\;*//g'`
+               fi
+            done
+            if [ "$PHA" != "true" ]
+            then
+               WASENV=`echo NOPHA:NODMGRPHA+NONE+NONE:$WASDIR:$CELL_NAME:$NODE_PROFILES:nodmgr:$user`
+            else
+               WASENV=`echo PHA:NODMGRPHA+NONE+NONE:$WASDIR:$CELL_NAME:$NODE_PROFILES:nodmgr:$user`
+            fi
+            if cat $WASDIR/properties/profileRegistry.xml | grep management > /dev/null 2>&1
+            then
+               for dmgrProfile in `cat $WASDIR/properties/profileRegistry.xml | grep management | grep "<profile isAReservationTicket" | awk -F"name=\"" '{print $2}' | awk -F"\"" '{print $1}'`
+               do
+                  dmgrProfilePath=`cat $WASDIR/properties/profileRegistry.xml | grep $dmgrProfile | grep "<profile isAReservationTicket" | awk -F"path=\"" '{print $2}' | awk -F"\"" '{print $1}'`
+                  CELL_NAME_D=`ls -1 $dmgrProfilePath/config/cells/*/cell.xml | awk -F"/" '{print $(NF-1)}'`
+                  if [ "$CELL_NAME" = "$CELL_NAME_D" ]
+                  then
+                     if [ "$PHA" != "true" ]
+                     then
+                        WASENV=`echo NOPHA:NODMGRPHA+NONE+NONE:$WASDIR:$CELL_NAME:$NODE_PROFILES:$dmgrProfilePath:$user`
+                     fi
+                     if [ "$PHA" == "true" ]
+                     then
+                        PHAPrimNode="false"
+                        srvIndexXml=`find $dmgrProfilePath/config/cells/ -name serverindex.xml | grep $dmgrProfile| head -1`
+                        checkRG
+                        if [ "$DMGRPHA" == "true" ]
+                        then
+                           if [ "$PHAPrimNode" == "true" ]
+                           then
+                              WASENV=`echo PHA:DMGRPHA+$RESOURCE_GRP_FOUND+$RG_PRIM_NODE:$WASDIR:$CELL_NAME:$NODE_PROFILES:$dmgrProfilePath:$user`
+                           else
+                              WASENV=`echo PHA:DMGRPHA+$RESOURCE_GRP_FOUND+NOPHAPrimNode:$WASDIR:$CELL_NAME:$NODE_PROFILES:$dmgrProfilePath:$user`
+                           fi
+                        else
+                           WASENV=`echo PHA:NODMGRPHA+NONE+NONE:$WASDIR:$CELL_NAME:$NODE_PROFILES:$dmgrProfilePath:$user`
+                        fi
+                     fi
+                  fi
+               done
+            fi
+            #echo $WASENV
+            echo $WASENV >> $WAS_CELLS
+         done
+       fi
+    done
+   
+for cell in `cat $WAS_CELLS | awk -F":" '{print $4}'`
+do
+   WASDIR=`cat $WAS_CELLS | grep ":${cell}:" | awk -F":" '{print $3}'`
+   dmgrProfilePath=`cat $WAS_CELLS | grep ":${cell}:" | awk -F":" '{print $6}'`
+   dmgrProfile=`echo $dmgrProfilePath | awk -F"/" '{print $NF}'`
+   NODE_PROFILES=`cat $WAS_CELLS | grep ":${cell}:" | awk -F":" '{print $5}' | sed 's/;/\ /g'`
+   if [ "$dmgrProfilePath" != "nodmgr" ]
+   then
+      if ps -ef | grep $dmgrProfilePath | grep WsServer | grep dmgr | grep -v grep > /dev/null 2>&1
+      then
+         echo "$dmgrProfilePath dmgr UP" >> $JVM_STATE
+      else
+         echo "$dmgrProfilePath dmgr DOWN" >> $JVM_STATE
+      fi
+   fi
+
+   for nodeProfile in $NODE_PROFILES
+   do
+      NODE_PROFILEPATH=`cat $WASDIR/properties/profileRegistry.xml | grep "<profile isAReservationTicket" | grep $nodeProfile | awk -F"path=\"" '{print $2}' | awk -F"\"" '{print $1}'`
+      if ps -ef | grep $NODE_PROFILEPATH | grep WsServer | grep nodeagent | grep -v grep > /dev/null 2>&1
+      then
+         echo "$NODE_PROFILEPATH nodeagent UP" >> $JVM_STATE
+      else
+         echo "$NODE_PROFILEPATH nodeagent DOWN" >> $JVM_STATE
+      fi 
+      
+      JVMLIST=`ls -1 $NODE_PROFILEPATH/config/cells/$cell/nodes/*/servers | egrep -v "ihs|nodeagent"`
+      for JVM in $JVMLIST
+      do
+         if [ "$jvmSS" = "nojvms" ]
+         then
+            echo "$NODE_PROFILEPATH $JVM IGNORE" >> $JVM_STATE
+         else
+            if ps -ef | grep $NODE_PROFILEPATH | grep WsServer | grep " $JVM$" | grep -v grep > /dev/null 2>&1
+            then
+               echo "$NODE_PROFILEPATH $JVM UP" >> $JVM_STATE
+            else
+               echo "$NODE_PROFILEPATH $JVM DOWN" >> $JVM_STATE
+            fi
+         fi
+      done
+   done
+done
+
+collectECVInfo
+collectIHSInfo
+
+chmod 644 $WAS_CELLS $JVM_STATE $IHS_STATE $ECV_STATE
+chown wsadmin:wsadmin $WAS_CELLS $JVM_STATE $IHS_STATE $ECV_STATE
+
+}
+
+function listEnvironmentInfo {
+#set -x
+
+   target=$1
+   collectWASInfo
+   mkdir /tmp/$$
+   HOST=`hostname`
+   long_line=`awk 'BEGIN{for(c=0;c<115;c++) printf "-"; printf "\n"}'`
+   echo $long_line >> /tmp/$$/$HOST.report
+   echo "  STATUS OF WEBSPHERE ENVIRONMENT ON SERVER $HOST at `date`" >> /tmp/$$/$HOST.report
+   echo $long_line >> /tmp/$$/$HOST.report
+   echo >> /tmp/$$/$HOST.report
+   echo $long_line >> /tmp/$$/PHA.report
+   if cat $WAS_CELLS | grep "^PHA" > /dev/null 2>&1
+   then
+      PHAClusterState=`lssrc -ls clstrmgrES | grep ST_STABLE | wc -l`
+      if [ $PHAClusterState -eq 1 ]
+      then
+         echo "PowerHA is in Stable State on server $HOST" >> /tmp/$$/PHA.report
+      else
+         echo "PowerHA is NOT in Stable State on server $HOST" >> /tmp/$$/PHA.report
+      fi
+   else
+      echo "PowerHA is not configured on server $HOST" >> /tmp/$$/PHA.report
+   fi
+   echo $long_line >> /tmp/$$/PHA.report
+   echo >> /tmp/$$/PHA.report
+   cat /tmp/$$/PHA.report >> /tmp/$$/$HOST.report
+   echo >> /tmp/$$/$HOST.report
+
+   case "$target" in
+      was)
+         listWASInfo
+         for file in `ls /tmp/$$ | grep cell | grep report`
+         do
+            cat /tmp/$$/$file >> /tmp/$$/$HOST.report
+         done
+      ;;
+      ihs)
+         listIHSInfo
+         cat /tmp/$$/ihs.report >> /tmp/$$/$HOST.report
+      ;;
+      ecv)
+         listECVInfo
+         cat /tmp/$$/ecv.report >> /tmp/$$/$HOST.report
+      ;;
+      all)
+         listWASInfo
+         listIHSInfo
+         listECVInfo
+         for file in `ls /tmp/$$ | grep cell | grep report`
+         do
+            cat /tmp/$$/$file >> /tmp/$$/$HOST.report
+         done
+         cat /tmp/$$/ihs.report >> /tmp/$$/$HOST.report
+         cat /tmp/$$/ecv.report >> /tmp/$$/$HOST.report
+      ;;
+   esac
+   cat /tmp/$$/$HOST.report | tee -a $LOGDIR/$LOGNAM
+}
+
+function listWASInfo {
+#set -x
+         if [ ! -s $WAS_CELLS ]
+         then
+            echo  >> /tmp/$$/$HOST.report
+            echo $long_line >> /tmp/$$/$HOST.report
+            echo "No WAS Cells configured on $HOST" >> /tmp/$$/$HOST.report
+            echo $long_line >> /tmp/$$/$HOST.report
+            return
+         fi
+         for cell in `cat $WAS_CELLS | awk -F":" '{print $4}'`
+         do
+            WASDIR=`cat $WAS_CELLS | grep ":${cell}:" | awk -F":" '{print $3}'`
+            dmgrProfilePath=`cat $WAS_CELLS | grep ":${cell}:" | awk -F":" '{print $6}'`
+            if [ "$dmgrProfilePath" != "nodmgr" ]
+            then
+               dmgrProfile=`echo $dmgrProfilePath | awk -F"/" '{print $NF}'`
+               dmgr_cur_state=`cat $JVM_STATE | grep $dmgrProfilePath | awk '{print $3}'`
+               dmgr_ss_state=`cat $JVM_STATE_SS | grep $dmgrProfilePath | awk '{print $3}'`
+               echo "$dmgrProfile $dmgrProfilePath dmgr $dmgr_cur_state $dmgr_ss_state" >> /tmp/$$/cell.$cell.state
+            fi
+
+            NODE_PROFILES=`cat $WAS_CELLS | grep ":${cell}:" | awk -F":" '{print $5}' | sed 's/;/\ /g'`
+            for nodeProfile in $NODE_PROFILES
+            do
+               NODE_PROFILEPATH=`cat $WASDIR/properties/profileRegistry.xml | grep "<profile isAReservationTicket" | grep $nodeProfile | awk -F"path=\"" '{print $2}' | awk -F"\"" '{print $1}'`
+               nodeagent_cur_state=`cat $JVM_STATE | grep $NODE_PROFILEPATH | grep nodeagent | awk '{print $3}'`
+               nodeagent_ss_state=`cat $JVM_STATE_SS | grep $NODE_PROFILEPATH | grep nodeagent | awk '{print $3}'`
+               echo "$nodeProfile $NODE_PROFILEPATH nodeagent $nodeagent_cur_state $nodeagent_ss_state" >> /tmp/$$/cell.$cell.state
+               JVMLIST=`ls -1 $NODE_PROFILEPATH/config/cells/$cell/nodes/*/servers | egrep -v "ihs|nodeagent"`
+               for JVM in $JVMLIST
+               do
+                  jvm_cur_state=`cat $JVM_STATE | grep $NODE_PROFILEPATH | grep " $JVM " | awk '{print $3}'`
+                  jvm_ss_state=`cat $JVM_STATE_SS | grep $NODE_PROFILEPATH | grep " $JVM " | awk '{print $3}'`
+                  echo "$nodeProfile $NODE_PROFILEPATH $JVM $jvm_cur_state $jvm_ss_state" >> /tmp/$$/cell.$cell.state
+               done
+            done
+            echo $long_line >> /tmp/$$/cell.$cell.report
+            echo " Status of WebSphere CELL $cell on server $HOST" >> /tmp/$$/cell.$cell.report
+            echo $long_line >> /tmp/$$/cell.$cell.report
+            echo >> /tmp/$$/cell.$cell.report
+            echo "ProfilePath Process Current_State SS_State" | awk '{ printf "%-52s %-37s %-15s %-10s\n", $1, $2, $3, $4}' >> /tmp/$$/cell.$cell.report
+            echo "----------- ------- ------------- --------" | awk '{ printf "%-52s %-37s %-15s %-10s\n", $1, $2, $3, $4}' >> /tmp/$$/cell.$cell.report
+            cat /tmp/$$/cell.$cell.state  | awk '{ printf "%-52s %-37s %-15s %-10s\n", $2, $3, $4, $5}' >> /tmp/$$/cell.$cell.report
+         done
+   chmod -R 777 /tmp/$$
+}
+
+
+function listIHSInfo {
+#set -x
+
+      echo >> /tmp/$$/ihs.report
+      echo $long_line >> /tmp/$$/ihs.report
+      echo "  Status of IHS Environment on server $HOST" >> /tmp/$$/ihs.report
+      echo $long_line >> /tmp/$$/ihs.report
+      echo  >> /tmp/$$/ihs.report
+      echo $long_line >> /tmp/$$/ihs.report
+      echo "IHS_Install_Root IHS_Instance Current_State SS_State" | awk '{ printf "%-52s %-37s %-15s %-10s\n", $1, $2, $3, $4}' >> /tmp/$$/ihs.report
+      echo "---------------- ------------ ------------- --------" | awk '{ printf "%-52s %-37s %-15s %-10s\n", $1, $2, $3, $4}' >> /tmp/$$/ihs.report
+      echo >> /tmp/$$/ihs.report
+      for IBMHTTPROOT in `cat $IHS_STATE_SS | awk '{print $1}' | sort -u`
+      do
+         for IBMHTTPCONF in `cat $IHS_STATE_SS | grep $IBMHTTPROOT | awk '{print $3}'`
+         do
+            ihs_cur_state=`cat $IHS_STATE | grep $IBMHTTPROOT | grep -w $IBMHTTPCONF | awk '{print $6}'`
+            ihs_ss_state=`cat $IHS_STATE_SS | grep $IBMHTTPROOT | grep -w $IBMHTTPCONF | awk '{print $6}'`
+            echo "$IBMHTTPROOT ${IBMHTTPCONF} $ihs_cur_state $ihs_ss_state" >> /tmp/$$/ihs.state
+         done
+      done
+      cat /tmp/$$/ihs.state | awk '{ printf "%-52s %-37s %-15s %-10s\n", $1, $2, $3, $4}' >> /tmp/$$/ihs.report
+   chmod -R 777 /tmp/$$
+}
+
+
+function listECVInfo {
+#set -x
+#VVV
+      if [ -s $ECV_STATE ] 
+      then
+         echo  >> /tmp/$$/ecv.report
+      else
+         echo  >> /tmp/$$/ecv.report
+         echo $long_line >> /tmp/$$/ecv.report
+         echo "No ECVs defined on server $HOST" >> /tmp/$$/ecv.report
+         echo $long_line >> /tmp/$$/ecv.report
+         return
+      fi
+      echo $long_line >> /tmp/$$/ecv.report
+      echo "  Status of ECV Environment on server $HOST" >> /tmp/$$/ecv.report
+      echo $long_line >> /tmp/$$/ecv.report
+      echo  >> /tmp/$$/ecv.report
+      echo $long_line >> /tmp/$$/ecv.report
+      echo "IHS_Document_Root ECV_Name Current_State SS_State" | awk '{ printf "%-52s %-37s %-15s %-10s\n", $1, $2, $3, $4}' >> /tmp/$$/ecv.report
+      echo "----------------- -------- ------------- --------" | awk '{ printf "%-52s %-37s %-15s %-10s\n", $1, $2, $3, $4}' >> /tmp/$$/ecv.report
+      echo >> /tmp/$$/ecv.report
+      for IBMHTTPROOT in `cat $ECV_STATE_SS | awk '{print $1}' | sort -u`
+      do
+         for ECV_NAME in `cat $ECV_STATE_SS | grep $IBMHTTPROOT | awk '{print $2}'`
+         do
+            ecv_cur_state=`cat $ECV_STATE | grep $IBMHTTPROOT | grep " $ECV_NAME " | awk '{print $4}'`
+            ecv_ss_state=`cat $ECV_STATE_SS | grep $IBMHTTPROOT | grep " $ECV_NAME " | awk '{print $4}'`
+            echo "$IBMHTTPROOT ${ECV_NAME} $ecv_cur_state $ecv_ss_state" >> /tmp/$$/ecv.state
+         done
+      done
+      cat /tmp/$$/ecv.state | awk '{ printf "%-52s %-37s %-15s %-10s\n", $1, $2, $3, $4}' >> /tmp/$$/ecv.report
+   chmod -R 777 /tmp/$$
+}
+
+
+function collectECVInfo {
+
+rm $ECV_STATE
+touch $ECV_STATE
+chmod 644 $ECV_STATE
+chown wsadmin:wsadmin $ECV_STATE
+
+for IBMHTTPDIR in `find /[ou][ps][tr]/IBMHTTPD/v[89][05] -name version.signature | egrep -vi "backup|bkp|-|_"`
+do
+   IBMHTTPROOT=`echo $IBMHTTPDIR | sed "s/\/version.signature//g"`
+   IBMHTTPCONF=`echo $IBMHTTPDIR | sed "s/version.signature/conf/g"`
+   IBMHTTPBIN=`echo $IBMHTTPDIR | sed "s/version.signature/bin/g"`
+   IBMHTTPDOCROOT=`echo $IBMHTTPDIR | sed "s/version.signature/htdocs/g"`
+   for ecv in `ls -l $IBMHTTPDOCROOT | grep -v bk | grep html | grep -v index | awk '{print $9}'`
+   do
+      if [ -L $IBMHTTPDOCROOT/$ecv ]
+      then
+         symlink=`ls -l $IBMHTTPDOCROOT | grep $ecv | awk '{print $11}'`
+         if [ -f $symlink ]
+         then
+            ecv_state="UP"
+         else
+            ecv_state="DOWN"
+         fi
+      else
+         symlink="NoSymlink"
+         if echo $ecv | grep ecvup > /dev/null 2>&1
+         then
+            ecv_state="UP"
+         else
+            ecv_state="DOWN"
+        fi
+      fi
+         
+      echo "${IBMHTTPDOCROOT} ${ecv} $symlink $ecv_state" >> $ECV_STATE
+   done
+done
+
+}
+
+function collectIHSInfo {
+#set -x
+rm $IHS_STATE
+touch $IHS_STATE
+chmod 644 $IHS_STATE
+chown wsadmin:wsadmin $IHS_STATE
+for IBMHTTPDIR in `find /[ou][ps][tr]/IBMHTTPD/v[89][05] -name version.signature | egrep -vi "backup|bkp|-|_"`
+do
+   IBMHTTPROOT=`echo $IBMHTTPDIR | sed "s/\/version.signature//g"`
+   IBMHTTPCONF=`echo $IBMHTTPDIR | sed "s/version.signature/conf/g"`
+   IBMHTTPBIN=`echo $IBMHTTPDIR | sed "s/version.signature/bin/g"`
+   IBMHTTPDOCROOT=`echo $IBMHTTPDIR | sed "s/version.signature/htdocs/g"`
+   for conf_file_name in `ls $IBMHTTPCONF | grep conf$ | grep -v admin |grep -v ^httpd.conf`
+   do
+      conf_file=$IBMHTTPCONF/${conf_file_name}
+      user=`cat $conf_file | grep "^User " | awk '{print $2}'`
+      if [ "$user" = "nobody" ]
+      then
+         user="root"
+      fi
+#      echo $conf_file
+      for file in `find $IBMHTTPBIN -name "*.ctl" -o -name "*ctl" -o -name "apachectl_*" -o -name "apachectl-*" | egrep -v "bkp|backup"`
+      do
+         if grep ${conf_file_name} $file > /dev/null 2>&1
+         then
+            ctl_file=$file
+            if ps -ef | grep $IBMHTTPROOT | grep ${conf_file_name} > /dev/null 2>&1
+            then
+               echo "$IBMHTTPROOT $IBMHTTPCONF ${conf_file_name} $ctl_file $user UP" >> $IHS_STATE
+            else
+               echo "$IBMHTTPROOT $IBMHTTPCONF ${conf_file_name} $ctl_file $user DOWN" >> $IHS_STATE
+            fi
+         fi
+      done
+   done
+done
+
+}
+
+
+function startIHS {
+   
+   ihsInstance=$1
+   
+   if [ "$ihsInstance" = "laststop" ]
+   then
+      file=$IHS_STATE
+   fi
+   if [ "$ihsInstance" = "steadystate" ] || [ "$ihsInstance" = "all" ]
+   then
+      cat $IHS_STATE_SS | grep -v IGNORE >> /tmp/ihs.list.$$
+      file=/tmp/ihs.list.$$
+   fi
+   if [ "$ihsInstance" = "steadystate" ] || [ "$ihsInstance" = "laststop" ] || [ "$ihsInstance" = "all" ]
+   then
+      if [ ! -s $file ]
+      then
+         echo | tee -a $LOGDIR/$LOGNAM
+         echo "Info: --- No IHS servers to start"  | tee -a $LOGDIR/$LOGNAM
+         echo | tee -a $LOGDIR/$LOGNAM
+         echo "-------------------------------------------------------------------------------" | tee -a $LOGDIR/$LOGNAM
+         return
+      fi
+      while read line
+      do
+         INSTANCE_STATE=`echo $line | awk '{print $6}'`
+         if [ "$ihsInstance" = "all" ]
+         then
+            INSTANCE_STATE="UP"
+         fi
+         CTL_SCRIPT=`echo $line | awk '{print $4}'`
+         USER=`echo $line | awk '{print $5}'`
+         CONF_FILE=`echo $line | awk '{print $3}'`
+         IHSROOT=`echo $line | awk '{print $1}'`
+         instance=`echo $CONF_FILE | sed 's/\.conf//g'`
+         if [ "$INSTANCE_STATE" = "UP" ]
+         then
+            echo "Info: --- Starting instance $instance for $IHSROOT" | tee -a $LOGDIR/$LOGNAM
+            if ps -ef| grep $IHSROOT | grep "/$CONF_FILE " |grep -v grep > /dev/null 2>&1
+            then
+               echo "Info: --- IHS Instance $instance is already UP" | tee -a $LOGDIR/$LOGNAM
+            else
+               su $USER -c "$CTL_SCRIPT start"
+               sleep 2
+               ihsInstStatus=""
+               ihsInstStatus=`ps -ef| grep $IHSROOT |grep $instance |grep -v grep`
+               if [ "$ihsInstStatus" != "" ]
+               then
+                  ihsInstPids=`ps -ef| grep $IHSROOT |grep $instance |grep -v grep | awk '{print $2}'`
+                  echo "      Info: --- IHS instance $instance is RUNNING with PIDs: " | tee -a $LOGDIR/$LOGNAM
+                  echo  | tee -a $LOGDIR/$LOGNAM
+                  for pid in $ihsInstPids
+                  do
+                    echo "          $pid" | tee -a $LOGDIR/$LOGNAM
+                  done
+               else
+                  echo "      Error: --- IHS instance $instance is DOWN" | tee -a $LOGDIR/$LOGNAM
+               fi
+            fi 
+         fi
+      done < $file
+   else
+      line=`cat $IHS_STATE_SS | grep $ihsInstance | grep -v IGNORE` 
+      if [ "$line" != "" ]
+      then
+         CTL_SCRIPT=`echo $line | awk '{print $4}'`
+         USER=`echo $line | awk '{print $5}'`
+         CONF_FILE=`echo $line | awk '{print $3}'`
+         IHSROOT=`echo $line | awk '{print $1}'`
+         instance=`echo $CONF_FILE | sed 's/\.conf//g'`
+         echo "Info: --- starting instance $instance for $IHSROOT" | tee -a $LOGDIR/$LOGNAM
+         if ps -ef| grep $IHSROOT | grep "/$CONF_FILE " |grep -v grep > /dev/null 2>&1
+         then
+            echo "Info: --- IHS Instance $instance is already UP" | tee -a $LOGDIR/$LOGNAM
+         else
+            su $USER -c "$CTL_SCRIPT start"
+            sleep 2
+            ihsInstStatus=""
+            ihsInstStatus=`ps -ef| grep $IHSROOT |grep $instance |grep -v grep`
+            if [ "$ihsInstStatus" != "" ]
+            then
+              ihsInstPids=`ps -ef| grep $IHSROOT |grep $instance |grep -v grep | awk '{print $2}'`
+              echo "      Info: --- IHS instance $instance is RUNNING with PIDs: " | tee -a $LOGDIR/$LOGNAM
+              echo  | tee -a $LOGDIR/$LOGNAM
+              for pid in $ihsInstPids
+              do
+                 echo "          $pid" | tee -a $LOGDIR/$LOGNAM
+              done
+           else
+              echo "      Error: --- IHS instance $instance is DOWN" | tee -a $LOGDIR/$LOGNAM
+           fi
+         fi
+      else
+         echo "Error: --- IHS instance $instance does not exist in $IHSROOT" | tee -a $LOGDIR/$LOGNAM
+      fi
+
+   fi
+}
+
+function stopIHS {
+   ihsInstance=$1
+   
+   if [ "$ihsInstance" = "all" ]
+   then
+      collectIHSInfo
+      while read line
+      do
+         CTL_SCRIPT=`echo $line | awk '{print $4}'`
+         USER=`echo $line | awk '{print $5}'`
+         CONF_FILE=`echo $line | awk '{print $3}'`
+         IHSROOT=`echo $line | awk '{print $1}'`
+         instance=`echo $CONF_FILE | sed 's/\.conf//g'`
+         echo "Info: --- Stopping instance $instance for $IHSROOT" | tee -a $LOGDIR/$LOGNAM
+         if ps -ef| grep $IHSROOT | grep "/$CONF_FILE " | grep -v grep > /dev/null 2>&1
+         then
+            su $USER -c "$CTL_SCRIPT stop"
+            sleep 3
+            ihsInstStatus=""
+            ihsInstStatus=`ps -ef| grep $IHSROOT |grep $instance |grep -v grep`
+            if [ "$ihsInstStatus" != "" ]
+            then
+               echo "Error: --- IHS Instance $instance is still running. Killing PIDs" | tee -a $LOGDIR/$LOGNAM
+               ihsInstPids=`ps -ef| grep $IHSROOT |grep $instance |grep -v grep | awk '{print $2}'`
+               for pid in $ihsInstPids
+               do
+                  echo "     kill -9 $pid" | tee -a $LOGDIR/$LOGNAM
+                  kill -9 $pid
+               done
+            else
+               echo "Info: --- IHS Instance $instance is DOWN" | tee -a $LOGDIR/$LOGNAM
+            fi
+         else
+            echo "Info: --- IHS Instance $instance is already DOWN" | tee -a $LOGDIR/$LOGNAM
+         fi 
+      done < $IHS_STATE_SS
+   else
+      line=`cat $IHS_STATE_SS | grep $ihsInstance` 
+      if [ "$line" != "" ]
+      then
+         CTL_SCRIPT=`echo $line | awk '{print $4}'`
+         USER=`echo $line | awk '{print $5}'`
+         CONF_FILE=`echo $line | awk '{print $3}'`
+         IHSROOT=`echo $line | awk '{print $1}'`
+         instance=`echo $CONF_FILE | sed 's/\.conf//g'`
+         echo "Info: --- Stopping instance $instance for $IHSROOT" | tee -a $LOGDIR/$LOGNAM
+         if ps -ef| grep $IHSROOT | grep "/$CONF_FILE " | grep -v grep > /dev/null 2>&1
+         then
+            su $USER -c "$CTL_SCRIPT stop"
+            sleep 2
+            ihsInstStatus=""
+            ihsInstStatus=`ps -ef| grep $IHSROOT |grep $instance |grep -v grep`
+            if [ "$ihsInstStatus" != "" ]
+            then
+               echo "Error: --- IHS Instance $instance is still running. Killing PIDs" | tee -a $LOGDIR/$LOGNAM
+               ihsInstPids=`ps -ef| grep $IHSROOT |grep $instance |grep -v grep | awk '{print $2}'`
+               for pid in $ihsInstPids
+               do
+                  kill -9 $pid
+               done
+            else
+               echo "Info: --- IHS Instance $instance is DOWN" | tee -a $LOGDIR/$LOGNAM
+            fi
+         else
+            echo "Info: --- IHS Instance $instance is already DOWN" | tee -a $LOGDIR/$LOGNAM
+         fi
+      else
+         echo "Error: --- IHS instance $instance does not exist in $IHSROOT" | tee -a $LOGDIR/$LOGNAM
+      fi
+
+   fi
+}
+
+function makeECVUP {
+  ECV=$1
+  ECV_DOWN=`echo $ECV | sed "s/ecvup/ecvdown/g"`
+  ECV_UP=`echo $ECV | sed "s/ecvdown/ecvup/g"`
+  if [ -f $ECV_UP ]
+  then
+     echo | tee -a $LOGDIR/$LOGNAM
+     echo "Info: --- ECV $ECV_UP is already UP" | tee -a $LOGDIR/$LOGNAM
+     echo "Info: --- No State change required for $ECV_UP" | tee -a $LOGDIR/$LOGNAM
+     echo "-------------------------------------------------------------------------------" | tee -a $LOGDIR/$LOGNAM
+  fi
+  if [ -f $ECV_DOWN ]
+  then
+     echo | tee -a $LOGDIR/$LOGNAM
+     echo "Info: --- Making ECV $ECV_DOWN UP" | tee -a $LOGDIR/$LOGNAM
+     mv $ECV_DOWN $ECV_UP
+     if [ -f $ECV_UP ]
+     then
+        echo "Info: --- ECV $ECV_UP is UP" | tee -a $LOGDIR/$LOGNAM
+     fi
+     echo "-------------------------------------------------------------------------------" | tee -a $LOGDIR/$LOGNAM
+  fi
+
+}
+
+function makeECVDOWN {
+  ECV=$1
+  ECV_DOWN=`echo $ECV | sed "s/ecvup/ecvdown/g"`
+  ECV_UP=`echo $ECV | sed "s/ecvdown/ecvup/g"`
+  if [ -f $ECV_DOWN ]
+  then
+     echo | tee -a $LOGDIR/$LOGNAM
+     echo "Info: --- ECV $ECV_DOWN is already DOWN" | tee -a $LOGDIR/$LOGNAM
+     echo "Info: --- No State change required for $ECV_DOWN" | tee -a $LOGDIR/$LOGNAM
+     echo "-------------------------------------------------------------------------------" | tee -a $LOGDIR/$LOGNAM
+  fi
+  if [ -f $ECV_UP ]
+  then
+     echo | tee -a $LOGDIR/$LOGNAM
+     echo "Info: --- Making ECV $ECV_UP DOWN" | tee -a $LOGDIR/$LOGNAM
+     mv $ECV_UP $ECV_DOWN
+     if [ -f $ECV_DOWN ]
+     then
+        echo "Info: --- ECV $ECV_DOWN is DOWN" | tee -a $LOGDIR/$LOGNAM
+     fi
+     echo "-------------------------------------------------------------------------------" | tee -a $LOGDIR/$LOGNAM
+  fi
+
+}
+
+function startECV {
+#set -x
+   ecvName=$1
+   if [ "$ecvName" = "laststop" ]
+   then
+      file=$ECV_STATE
+      ECVSTATE="LastStop"
+   fi
+   if [ "$ecvName" = "steadystate" ]
+   then
+      file=$ECV_STATE_SS
+      ECVSTATE="SteadyState"
+   fi
+   if [ "$ecvName" = "steadystate" ] || [ "$ecvName" = "laststop" ]
+   then
+      if [ ! -s $file ]
+      then
+         echo | tee -a $LOGDIR/$LOGNAM
+         echo "Info: --- No ECVs to start"  | tee -a $LOGDIR/$LOGNAM
+         echo | tee -a $LOGDIR/$LOGNAM
+         echo "-------------------------------------------------------------------------------" | tee -a $LOGDIR/$LOGNAM
+         return
+      fi
+      while read IBMHTTPDDOCROOT ECV_NAME symlink ecv_state
+      do
+        if [ "$symlink" = "NoSymlink" ]
+        then
+           ECV=$IBMHTTPDDOCROOT/$ECV_NAME
+        else
+           ECV=$symlink
+        fi
+        echo | tee -a $LOGDIR/$LOGNAM
+        echo "-------------------------------------------------------------------------------" | tee -a $LOGDIR/$LOGNAM
+        if [ "$ecv_state" = "DOWN" ]
+        #if echo $ECV | grep ecvdown > /dev/null 2>&1
+        then
+           echo "Info: --- Recorded $ECVSTATE state for ECV $ECV is DOWN" | tee -a $LOGDIR/$LOGNAM
+           makeECVDOWN $ECV
+        fi
+        if [ "$ecv_state" = "UP" ]
+        #if echo $ECV | grep ecvup > /dev/null 2>&1
+        then
+           echo "Info: --- Recorded $ECVSTATE state for ECV $ECV is UP" | tee -a $LOGDIR/$LOGNAM
+           makeECVUP $ECV
+        fi
+      done < $file
+   return
+   fi
+   if [ "$ecvName" = "all" ]
+   then
+      for IBMHTTPDDOCROOT in `cat $ECV_STATE_SS | awk '{print $1}' | sort -u`
+      do
+         for ECV_NAME in `cat $ECV_STATE_SS | grep $IBMHTTPDDOCROOT | awk '{print $2}'`
+         do
+            symlink=`cat $ECV_STATE_SS | grep $IBMHTTPDDOCROOT | grep " $ECV_NAME " | awk '{print $3}'`
+            if [ "$symlink" = "NoSymlink" ]
+            then
+               ECV=$IBMHTTPDDOCROOT/$ECV_NAME
+            else
+               ECV=$symlink
+            fi
+            makeECVUP $ECV
+         done 
+      done
+   else
+      ECV_NAME=$ecvName
+      ECV_NAME_DOWN=`echo $ECV_NAME | sed "s/ecvup/ecvdown/g"` 
+      ECV_NAME_UP=`echo $ECV_NAME | sed 's/ecvdown/ecvup/g'`
+      for IBMHTTPDDOCROOT in `cat $ECV_STATE_SS | awk '{print $1}' | sort -u`
+      do
+         ECV_NAME_F=`cat $ECV_STATE_SS | grep $IBMHTTPDDOCROOT | egrep " $ECV_NAME_DOWN | $ECV_NAME_UP " | awk '{print $2}'`
+         if [ "$ECV_NAME_F" != "" ]
+         then 
+            symlink=`cat $ECV_STATE_SS | grep $IBMHTTPDDOCROOT | grep " $ECV_NAME_F " | awk '{print $3}'`
+            if [ "$symlink" = "NoSymlink" ]
+            then
+               ECV=$IBMHTTPDDOCROOT/$ECV_NAME_F
+            else
+               ECV=$symlink
+            fi
+            makeECVUP $ECV
+         else
+            echo "Error: --- Wrong ECV name $ecvName" | tee -a $LOGDIR/$LOGNAM
+            exit 1
+         fi
+      done
+   fi      
+
+}
+
+function stopECV {
+#set -x
+   ecvName=$1
+   if [ "$ecvName" = "all" ]
+   then
+      collectECVInfo
+      for IBMHTTPDDOCROOT in `cat $ECV_STATE_SS | awk '{print $1}' | sort -u`
+      do
+         for ECV_NAME in `cat $ECV_STATE_SS | grep $IBMHTTPDDOCROOT | awk '{print $2}'`
+         do
+             symlink=`cat $ECV_STATE_SS | grep $IBMHTTPDDOCROOT | grep " $ECV_NAME " | awk '{print $3}'`
+             if [ "$symlink" = "NoSymlink" ]
+             then
+                ECV=$IBMHTTPDDOCROOT/$ECV_NAME
+             else
+                ECV=$symlink
+             fi
+             makeECVDOWN $ECV          
+         done 
+      done
+   else
+      ECV_NAME=$ecvName
+      ECV_NAME_DOWN=`echo $ECV_NAME | sed "s/ecvup/ecvdown/g"` 
+      ECV_NAME_UP=`echo $ECV_NAME | sed 's/ecvdown/ecvup/g'`
+      for IBMHTTPDDOCROOT in `cat $ECV_STATE_SS | awk '{print $1}' | sort -u`
+      do
+         ECV_NAME_F=`cat $ECV_STATE_SS | grep $IBMHTTPDDOCROOT | egrep " $ECV_NAME_DOWN | $ECV_NAME_UP " | awk '{print $2}'`
+         if [ "$ECV_NAME_F" != "" ]
+         then 
+            symlink=`cat $ECV_STATE_SS | grep $IBMHTTPDDOCROOT | grep " $ECV_NAME_F " | awk '{print $3}'`
+            if [ "$symlink" = "NoSymlink" ]
+            then
+               ECV=$IBMHTTPDDOCROOT/$ECV_NAME_F
+            else
+               ECV=$symlink
+            fi
+            makeECVDOWN $ECV
+         else
+            echo "Error: --- Wrong ECV name $ecvName" | tee -a $LOGDIR/$LOGNAM
+            exit 1
+         fi
+      done
+   fi      
+
+}
+
+
+function startCells {
+   wascell=$1
+   jvmRule=$2
+   jvmName=$3
+
+   if [ "$wascell" = "all" ]
+   then
+      for cell in `cat $WAS_CELLS | awk -F":" '{print $4}'`
+      do
+         startOneCell $cell $jvmRule
+      done
+   else
+      cell=$wascell
+      if [ "$jvmRule" != "jvm" ]
+      then
+         startOneCell $cell $jvmRule
+      else
+         startOneCell $cell $jvmRule $jvmName
+      fi
+   fi
+
+}
+
+function stopCells {
+   wascell=$1
+   jvmRule=$2
+   jvmName=$3
+
+   if [ "$wascell" = "all" ]
+   then
+      collectWASInfo
+      for cell in `cat $WAS_CELLS | awk -F":" '{print $4}'`
+      do
+         stopOneCell $cell $jvmRule
+      done
+   else
+      cell=$wascell
+      if [ "$jvmRule" != "jvm" ]
+      then
+         stopOneCell $cell $jvmRule
+      else
+         stopOneCell $cell $jvmRule $jvmName
+      fi
+   fi
+
+}
+
+function startOneCell {
+   cell=$1
+   jvmRule=$2 
+   jvmName=$3
+
+   PHATRUE=`cat $WAS_CELLS |grep ":${cell}:" | awk -F":" '{print $1}'`
+   dmgrPHA=`cat $WAS_CELLS |grep ":${cell}:" | awk -F":" '{print $2}' | awk -F"+" '{print $1}'`
+   dmgrResGrp=`cat $WAS_CELLS |grep ":${cell}:" | awk -F":" '{print $2}' | awk -F"+" '{print $2}'`
+   dmgrPrimNode=`cat $WAS_CELLS |grep ":${cell}:" | awk -F":" '{print $2}' | awk -F"+" '{print $3}'`
+   WASDIR=`cat $WAS_CELLS |grep ":${cell}:" | awk -F":" '{print $3}'`
+   nodes=`cat $WAS_CELLS |grep ":${cell}:" | awk -F":" '{print $5}'`
+   dmgrProfile=`cat $WAS_CELLS |grep ":${cell}:" | awk -F":" '{print $6}' | awk -F"/" '{print $NF}'`
+   dmgrProfilePath=`cat $WAS_CELLS |grep ":${cell}:" | awk -F":" '{print $6}'`
+   userId=`cat $WAS_CELLS |grep ":${cell}:" | awk -F":" '{print $7}'`
+   echo | tee -a $LOGDIR/$LOGNAM
+   echo | tee -a $LOGDIR/$LOGNAM
+   if [ "$jvmRule" = "jvm" ]
+   then
+      echo "===============================================================================" | tee -a $LOGDIR/$LOGNAM
+      echo "Info: --- Starting jvm $jvmName for CELL $cell WAS_ROOT = $WASDIR" | tee -a $LOGDIR/$LOGNAM
+      echo "===============================================================================" | tee -a $LOGDIR/$LOGNAM
+      profiles=`cat $WAS_CELLS | grep ":${cell}:" | awk -F":" '{print $5}' | sed 's/\;/\|/g'`
+      NODE_PROFILEPATH=`cat $JVM_STATE | grep "$jvmName" | egrep "$profiles" | awk '{print $1}' | sort -u`
+      NODE_NAME=`find $NODE_PROFILEPATH/config/cells/$cell/nodes/*[Nn]*/servers/nodeagent -name server.xml | awk -F"/" '{print $(NF-3)}'`
+      profileName=`echo $NODE_PROFILEPATH | awk -F"/" '{print $NF}'`
+      startJvms $WASDIR $cell $NODE_PROFILEPATH $NODE_NAME $profileName $userId $jvmRule $jvmName
+      return
+   fi
+   echo "===============================================================================" | tee -a $LOGDIR/$LOGNAM
+   echo "Info: --- Starting CELL $cell from WAS_ROOT = $WASDIR" | tee -a $LOGDIR/$LOGNAM
+   echo "===============================================================================" | tee -a $LOGDIR/$LOGNAM
+   if [ "$jvmRule" = "jvmsonly" ]
+   then
+      startNodeProfiles $WASDIR $cell $nodes $userId $jvmRule
+      return
+   fi
+#------------------------------------------------------------------------------------------
+# If PHA is not in stable state script will exit with return code 1 after previous function
+#------------------------------------------------------------------------------------------
+   if [ "$PHATRUE" = "PHA" ]
+   then
+      checkPHAClusterState
+      if [ "$dmgrPHA" = "DMGRPHA" ]
+      then
+         if [ "$dmgrPrimNode" = "$HOST" ]
+         then
+            startRGforProfile $dmgrProfile $dmgrResGrp $dmgrPrimNode
+            checkStartDMGRProcessPHA $dmgrProfile $dmgrResGrp $dmgrPrimNode
+         fi
+      else
+         startDMGR $WASDIR $dmgrProfile $dmgrProfilePath $userId
+      fi
+   else
+      startDMGR $WASDIR $dmgrProfile $dmgrProfilePath $userId
+   fi
+   startNodeProfiles $WASDIR $cell $nodes $userId $jvmRule
+
+   # FIX: Ensure JVMs start after NodeAgents
+   if [ "$jvmRule" = "all" ] || [ "$jvmRule" = "steadystate" ] || [ "$jvmRule" = "laststop" ] || [ -z "$jvmRule" ]
+   then
+      echo "-------------------------------------------------------------------------------" | tee -a $LOGDIR/$LOGNAM
+      echo "Info: --- Starting JVMs for CELL $cell" | tee -a $LOGDIR/$LOGNAM
+      echo "-------------------------------------------------------------------------------" | tee -a $LOGDIR/$LOGNAM
+      startJvms $WASDIR $cell $nodes "" "" $userId "all" ""
+   fi
+
+}
+         
+function stopOneCell {
+   cell=$1
+   jvmRule=$2 
+   jvmName=$3
+
+   PHATRUE=`cat $WAS_CELLS |grep ":${cell}:" | awk -F":" '{print $1}'`
+   dmgrPHA=`cat $WAS_CELLS |grep ":${cell}:" | awk -F":" '{print $2}' | awk -F"+" '{print $1}'`
+   dmgrResGrp=`cat $WAS_CELLS |grep ":${cell}:" | awk -F":" '{print $2}' | awk -F"+" '{print $2}'`
+   dmgrPrimNode=`cat $WAS_CELLS |grep ":${cell}:" | awk -F":" '{print $2}' | awk -F"+" '{print $3}'`
+   WASDIR=`cat $WAS_CELLS |grep ":${cell}:" | awk -F":" '{print $3}'`
+   nodes=`cat $WAS_CELLS |grep ":${cell}:" | awk -F":" '{print $5}'`
+   dmgrProfile=`cat $WAS_CELLS |grep ":${cell}:" | awk -F":" '{print $6}' | awk -F"/" '{print $NF}'`
+   dmgrProfilePath=`cat $WAS_CELLS |grep ":${cell}:" | awk -F":" '{print $6}'`
+   userId=`cat $WAS_CELLS |grep ":${cell}:" | awk -F":" '{print $7}'`
+   echo | tee -a $LOGDIR/$LOGNAM
+   echo | tee -a $LOGDIR/$LOGNAM
+   if [ "$jvmRule" = "jvm" ]
+   then
+      echo "===============================================================================" | tee -a $LOGDIR/$LOGNAM
+      echo "Info: --- Stopping jvm $jvmName for CELL $cell from WAS_ROOT = $WASDIR" | tee -a $LOGDIR/$LOGNAM
+      echo "===============================================================================" | tee -a $LOGDIR/$LOGNAM
+      profiles=`cat $WAS_CELLS | grep ":${cell}:" | awk -F":" '{print $5}' | sed 's/\;/\|/g'`
+      NODE_PROFILEPATH=`cat $JVM_STATE | grep "$jvmName" | egrep "$profiles" | awk '{print $1}' | sort -u`
+      NODE_NAME=`find $NODE_PROFILEPATH/config/cells/$cell/nodes/*[Nn]*/servers/nodeagent -name server.xml | awk -F"/" '{print $(NF-3)}'`
+      profileName=`echo $NODE_PROFILEPATH | awk -F"/" '{print $NF}'`
+      stopJvms $WASDIR $cell $NODE_PROFILEPATH $NODE_NAME $profileName $userId $jvmRule $jvmName
+      return
+   fi
+   echo "===============================================================================" | tee -a $LOGDIR/$LOGNAM
+   echo "Info: --- Stopping CELL $cell from WAS_ROOT = $WASDIR" | tee -a $LOGDIR/$LOGNAM
+   echo "===============================================================================" | tee -a $LOGDIR/$LOGNAM
+   stopNodeProfiles $WASDIR $cell $nodes $userId $jvmRule
+   if [ "$jvmRule" = "jvmsonly" ]
+   then
+      return
+   fi
+#------------------------------------------------------------------------------------------
+# If PHA is not in stable state script will exit with return code 1 after previous function
+#------------------------------------------------------------------------------------------
+   if [ "$PHATRUE" = "PHA" ]
+   then
+      checkPHAClusterState
+      if [ "$dmgrPHA" = "DMGRPHA" ]
+      then
+         if [ "$dmgrPrimNode" = "$HOST" ]
+         then
+            stopRGforProfile $dmgrProfile $dmgrResGrp $dmgrPrimNode
+            checkStopDMGRProcessPHA $dmgrProfile $dmgrResGrp $dmgrPrimNode
+         fi
+      else
+         stopDMGR $WASDIR $dmgrProfile $dmgrProfilePath $userId
+      fi
+   else
+      stopDMGR $WASDIR $dmgrProfile $dmgrProfilePath $userId
+   fi
+
+}
+
+function steadyStateCheck {
+   resultCode=0
+   echo | tee -a $LOGDIR/$LOGNAM
+   echo "-------------------------------------------------------------------------------" | tee -a $LOGDIR/$LOGNAM
+   echo " Performing Steady State Check on `hostname` at `date`" | tee -a $LOGDIR/$LOGNAM
+   echo "-------------------------------------------------------------------------------" | tee -a $LOGDIR/$LOGNAM
+   echo | tee -a $LOGDIR/$LOGNAM
+   resultCode=0
+   WAS_CELLS_SS=$SCRIPTDIR/steadyState/was_cells
+   JVM_STATE_SS=$SCRIPTDIR/steadyState/jvm_state
+   IHS_STATE_SS=$SCRIPTDIR/steadyState/ihs_state
+   ECV_STATE_SS=$SCRIPTDIR/steadyState/ecv_state
+
+   collectWASInfo
+   if cat $WAS_CELLS_SS | grep "^PHA" > /dev/null 2>&1
+   then
+      PHAClusterState=`lssrc -ls clstrmgrES | grep ST_STABLE | wc -l`
+      if [ $PHAClusterState -eq 1 ]
+      then
+         echo "   PHA Steady State Check: PASSED" | tee -a $LOGDIR/$LOGNAM
+      else
+         echo "   PHA Steady State Check: FAILED" | tee -a $LOGDIR/$LOGNAM
+
+      fi
+   else
+      echo "   PHA Steady State Check: PHA is NOT INSTALLED"
+   fi
+
+   if [ -s $WAS_CELLS_SS ]
+   then
+      diff $WAS_CELLS_SS $WAS_CELLS > /tmp/diff.was.$$
+      if [ $? -eq 0 ]
+      then
+         echo "   WAS Cells Steady State Check: PASSED" | tee -a $LOGDIR/$LOGNAM
+      else
+         echo "   WAS Cells Steady State Check: FAILED" | tee -a $LOGDIR/$LOGNAM
+         resultCode=1
+      fi
+#
+# JVM Check
+#
+      ret=0
+      while read line
+      do
+         profile_root=`echo $line | awk '{print $1}'`
+         jvm_name=`echo $line | awk '{print $2}'`
+         jvm_state=`echo $line | awk '{print $3}'`
+         if [ "$jvm_state" = "IGNORE" ]
+         then
+            continue
+         else
+            if cat $JVM_STATE | grep $profile_root | grep " $jvm_name " | grep $jvm_state > /dev/null 2>&1
+            then
+               continue
+            else
+               if cat $JVM_STATE | grep $profile_root | grep " $jvm_name " > /dev/null 2>&1
+               then
+                  echo "       Error: --- $jvm_name for $profile_root should be $jvm_state" >> /tmp/jvm.state.$$
+               else
+                  echo "       Error: --- $jvm_name process for $profile_root is missing " >> /tmp/jvm.state.$$
+               fi
+               ret=1
+            fi
+         fi
+      done < $JVM_STATE_SS
+   
+      if [ $ret -eq 0 ]
+      then
+         echo "   JVM/NODE/DMGR Steady State Check: PASSED" | tee -a $LOGDIR/$LOGNAM
+      else
+         echo "   JVM/NODE/DMGR Steady State Check: FAILED" | tee -a $LOGDIR/$LOGNAM
+         cat /tmp/jvm.state.$$ | tee -a $LOGDIR/$LOGNAM
+         resultCode=1
+      fi
+   else
+         echo "   WAS Cells Steady State Check: N/A" | tee -a $LOGDIR/$LOGNAM
+         echo "   JVM/NODE/DMGR Steady State Check: N/A" | tee -a $LOGDIR/$LOGNAM
+   fi
+#
+# IHS Check
+#
+   ret=0
+   while read line
+   do
+      ihs_root=`echo $line | awk '{print $1}'`
+      ihs_name=`echo $line | awk '{print $3}'`
+      ihs_state=`echo $line | awk '{print $NF}'`
+      if [ "$ihs_state" = "IGNORE" ]
+      then
+         continue
+      else
+         if cat $IHS_STATE | grep $ihs_root | grep $ihs_name | grep $ihs_state > /dev/null 2>&1
+         then
+            continue
+         else
+            if cat $IHS_STATE | grep $ihs_root | grep $ihs_name > /dev/null 2>&1
+            then
+               echo "       Error: --- $ihs_name for $ihs_root should be $ihs_state" >> /tmp/ihs.state.$$
+            else
+               echo "       Error: --- $ihs_name process for $ihs_root is missing " >> /tmp/ihs.state.$$
+            fi
+            ret=1
+         fi
+      fi
+   done < $IHS_STATE_SS
+
+   if [ $ret -eq 0 ]
+   then
+      echo "   IHS Steady State Check: PASSED" | tee -a $LOGDIR/$LOGNAM
+   else
+      echo "   IHS Steady State Check: FAILED" | tee -a $LOGDIR/$LOGNAM
+      cat /tmp/ihs.state.$$ | tee -a $LOGDIR/$LOGNAM
+      resultCode=1
+   fi
+#
+# ECV check
+#
+   ECV_resultCode=0
+   while read IBMHTTPDDOCROOT ECV_NAME symlink ecv_state
+   do
+      ECV=$IBMHTTPDDOCROOT/$ECV_NAME
+      ECV_NAME_DOWN=`echo $ECV_NAME | sed "s/ecvup/ecvdown/g"`
+      ECV_NAME_UP=`echo $ECV_NAME | sed 's/ecvdown/ecvup/g'`
+      ecv_current_state=`cat $ECV_STATE | grep $IBMHTTPDDOCROOT | egrep " $ECV_NAME_DOWN | $ECV_NAME_UP " | awk '{print $NF}'`
+      if [ "$ecv_state" != "$ecv_current_state" ]
+      then
+         echo "      Error: --- ECV $ECV has wrong state $ecv_current_state" >> /tmp/ecv.state.$$
+         ECV_resultCode=1
+      fi
+   done < $ECV_STATE_SS      
+   if [ $ECV_resultCode -eq 0 ]
+   then
+      echo "   ECV Steady State Check: PASSED" | tee -a $LOGDIR/$LOGNAM
+   else
+      echo "   ECV Steady State Check: FAILED" | tee -a $LOGDIR/$LOGNAM
+      cat /tmp/ecv.state.$$ | tee -a $LOGDIR/$LOGNAM
+      resultCode=1
+   fi
+   echo | tee -a $LOGDIR/$LOGNAM
+   echo "-------------------------------------------------------------------------------" | tee -a $LOGDIR/$LOGNAM
+   if [ $resultCode -ne 0 ]
+   then
+      echo "Steady State Check FAILED for `hostname` " | tee -a $LOGDIR/$LOGNAM
+   else
+      echo "Steady State Check is SUCCESSFUL on `hostname`" | tee -a $LOGDIR/$LOGNAM
+   fi
+   echo "-------------------------------------------------------------------------------" | tee -a $LOGDIR/$LOGNAM
+   #rm /tmp/*.$$
+   exit $resultCode
+
+}
+         
+function steadyStateInfo {
+   jvmSS=$1
+
+   WAS_CELLS=$SCRIPTDIR/currentState/was_cells
+   JVM_STATE=$SCRIPTDIR/currentState/jvm_state
+   IHS_STATE=$SCRIPTDIR/currentState/ihs_state
+   ECV_STATE=$SCRIPTDIR/currentState/ecv_state
+   WAS_CELLS_SS=$SCRIPTDIR/steadyState/was_cells
+   JVM_STATE_SS=$SCRIPTDIR/steadyState/jvm_state
+   IHS_STATE_SS=$SCRIPTDIR/steadyState/ihs_state
+   ECV_STATE_SS=$SCRIPTDIR/steadyState/ecv_state
+   mkdir $SCRIPTDIR/steadyState > /dev/null 2>&1
+   collectWASInfo $jvmSS
+   cp -p $WAS_CELLS $WAS_CELLS_SS
+   cp -p $JVM_STATE $JVM_STATE_SS
+   cp -p $IHS_STATE $IHS_STATE_SS
+   cp -p $ECV_STATE $ECV_STATE_SS
+   chmod -R 755 $SCRIPTDIR/steadyState
+   chown -R wsadmin:wsadmin $SCRIPTDIR/steadyState
+
+}
+
+function printUsage {
+   echo "       dzdo $SCRIPT_NAME list <was|ihs|ecv|all>"
+   echo "OR"
+   echo "       dzdo $SCRIPT_NAME steadystatecheck"
+   echo "OR"
+   echo "       dzdo $SCRIPT_NAME steadystate"
+   echo "OR"
+   echo "       dzdo $SCRIPT_NAME steadystate nojvms"
+   echo "OR"
+   echo "       dzdo $SCRIPT_NAME <start> <was> <cellName|all> <nojvms|jvmsonly|laststop|steadystate|all>"
+   echo "OR"
+   echo "       dzdo $SCRIPT_NAME <start> <was> <cellName> <jvm> <jvmName>"
+   echo "OR"
+   echo "       dzdo $SCRIPT_NAME <start> <ihs> <instanceName|laststop|steadystate|all>"
+   echo "OR"
+   echo "       dzdo $SCRIPT_NAME <start> <ecv> <ecvName|laststop|steadystate|all>"
+   echo "OR"
+   echo "       dzdo $SCRIPT_NAME <stop> <was> <cellName|all> <all|jvmsonly>"
+   echo "OR"
+   echo "       dzdo $SCRIPT_NAME <stop> <was> <cellName> <jvm> <jvmName>"
+   echo "OR"
+   echo "       dzdo $SCRIPT_NAME <stop> <ihs> <instanceName|all>"
+   echo "OR"
+   echo "       dzdo $SCRIPT_NAME <stop> <ecv> <ecvName|all>"
+}
+
+##################################
+#   Main
+##################################
+#set -x
+
+SCRIPT_NAME=$0
+CURRENT_USER=`id -un`
+LOGIN_USER=`logname`
+#if [ "$LOGIN_USER" == "$CURRENT_USER" ] || [ "$CURRENT_USER" != "root" ]
+if [ "$LOGIN_USER" == "$CURRENT_USER" ] && [ "$CURRENT_USER" != "root" ]
+then
+        echo "Error: --- This script $SCRIPT_NAME can be run only as $LOGIN_USER user with dzdo"
+        printUsage
+        exit 1
+fi
+
+#DATE=`date +%m%d%Y`
+DATE=`date +"%m%d%Y-%H%M%S"`
+HOST=`hostname`
+DMGRPHA="false"
+SCRIPTDIR=/opt/WebSphere/util/scripts
+LOGDIR="/opt/WebSphere/util/logs"
+#LOGDIR=./logs
+NODE_START_TIMEOUT=1200
+JVM_STARTUP_TIMEOUT=600
+LOGNAM=`basename ${SCRIPT_NAME} .sh`-$HOST-$DATE.log
+mkdir $LOGDIR > /dev/null 2>&1
+chmod -R 755 $LOGDIR
+chown -R wsadmin:wsadmin $LOGDIR
+
+if [ ! -f $LOGDIR/$LOGNAM ]
+then
+   touch $LOGDIR/$LOGNAM
+fi
+chmod 644 $LOGDIR/$LOGNAM
+chown wsadmin:wsadmin $LOGDIR/$LOGNAM
+
+#############################################################
+#  Deleting old logs from /opt/WebSphere/util/logs directory
+#############################################################
+
+find /opt/WebSphere/util/logs -type f -mtime +90 -exec rm -rf {} \;
+
+
+WAS_CELLS=$SCRIPTDIR/currentState/was_cells
+JVM_STATE=$SCRIPTDIR/currentState/jvm_state
+IHS_STATE=$SCRIPTDIR/currentState/ihs_state
+ECV_STATE=$SCRIPTDIR/currentState/ecv_state
+WAS_CELLS_SS=$SCRIPTDIR/steadyState/was_cells
+JVM_STATE_SS=$SCRIPTDIR/steadyState/jvm_state
+IHS_STATE_SS=$SCRIPTDIR/steadyState/ihs_state
+ECV_STATE_SS=$SCRIPTDIR/steadyState/ecv_state
+mkdir $SCRIPTDIR/steadyState $SCRIPTDIR/currentState > /dev/null 2>&1
+chmod -R 755 $SCRIPTDIR/steadyState $SCRIPTDIR/currentState
+chown -R wsadmin:wsadmin $SCRIPTDIR/steadyState $SCRIPTDIR/currentState
+
+action=""
+target=""
+targetCell=all
+jvmRule=all
+ecvPort=all
+ihsInstance=all
+
+if [ $# -lt 1 ]
+then
+   printUsage
+   exit 1
+fi
+echo "===============================================================================" | tee -a $LOGDIR/$LOGNAM
+case $# in
+	1) echo "Starting script \"$0 $1\" at `date`" | tee -a $LOGDIR/$LOGNAM
+	;;
+        2) echo "Starting script \"$0 $1 $2\" at `date`" | tee -a $LOGDIR/$LOGNAM
+	;;
+        3) echo "Starting script \"$0 $1 $2 $3\" at `date`" | tee -a $LOGDIR/$LOGNAM
+	;;
+        4) echo "Starting script \"$0 $1 $2 $3 $4\" at `date`" | tee -a $LOGDIR/$LOGNAM
+	;;
+        5) echo "Starting script \"$0 $1 $2 $3 $4 $5\" at `date`" | tee -a $LOGDIR/$LOGNAM
+        ;;
+        *) echo "Error: --- Wrong number of parameters $# " | tee -a $LOGDIR/$LOGNAM
+           printUsage
+	   exit 1
+	;;
+esac
+echo "Log file $LOGDIR/$LOGNAM" | tee -a $LOGDIR/$LOGNAM
+echo "===============================================================================" | tee -a $LOGDIR/$LOGNAM
+	   
+if [ "$1" = "steadystate" ] 
+then
+   if [ $# -eq 1 ]
+   then
+      steadyStateInfo all
+      echo | tee -a $LOGDIR/$LOGNAM
+      echo "Steady State info is recorded for `hostname` at `date`" | tee -a $LOGDIR/$LOGNAM
+      echo "===============================================================================" | tee -a $LOGDIR/$LOGNAM
+      exit 0
+   else
+      if [ $# -eq 2 ] && [ "$2" = "nojvms" ]
+      then
+         steadyStateInfo nojvms
+         echo | tee -a $LOGDIR/$LOGNAM
+         echo "Steady State info is recorded for `hostname` at `date`" | tee -a $LOGDIR/$LOGNAM
+         echo "===============================================================================" | tee -a $LOGDIR/$LOGNAM
+         exit 0
+      else
+         echo "Error: --- wrong parameter $2 for $1" | tee -a $LOGDIR/$LOGNAM
+         printUsage
+         exit 1
+      fi
+   fi
+fi
+if [ "$1" = "steadystatecheck" ]
+then
+   steadyStateCheck
+   exit 0
+fi
+
+if [ $# -eq 2 ]
+then
+   if [ "$1" = "list" ]
+   then
+      if [ "$2" = "was" ] || [ "$2" = "ihs" ] || [ "$2" = "ecv" ] || [ "$2" = "all" ]
+      then
+         listEnvironmentInfo $2
+         exit 0
+      else
+         echo "Error: --- Wrong parameter $2 for \"$0 list \" option" | tee -a $LOGDIR/$LOGNAM
+         exit 1
+      fi
+   fi
+fi
+
+if [ $# -gt 1 ]
+then
+   case $1 in
+     start|stop)
+        case $2 in
+           was|ihs|ecv)
+              target=$2
+              action=$1
+           ;;
+           *)
+              echo "Error: --- wrong parameter $2 for $0 $1" | tee -a $LOGDIR/$LOGNAM
+              printUsage
+              exit 1
+           ;;
+        esac
+     ;;
+     *)
+        echo "Error: --- wrong parameter $1" | tee -a $LOGDIR/$LOGNAM
+        printUsage
+        exit 1
+     ;;
+   esac
+fi
+
+
+if [ $# -eq 5 ]
+then
+   if [ "$2" = "was" ]
+   then
+      if cat $WAS_CELLS | awk -F":" '{print $4}' | grep $3 > /dev/null 2>&1
+      then
+         targetCell=$3
+         targetNode=`cat $WAS_CELLS | grep $targetCell | awk -F":" '{print $5}' | sed 's/\;/\|/g'`
+         if [ "$4" = "jvm" ]
+         then
+            jvmRule="jvm"
+            if cat $JVM_STATE | egrep "$targetNode" | grep $5  > /dev/null 2>&1
+            then
+               jvmName=$5
+            else
+               echo "Error: --- wrong parameter $5 for $0 $1 $2 $3 $4" | tee -a $LOGDIR/$LOGNAM
+               printUsage
+               exit 1
+            fi
+         else
+            echo "Error: --- wrong parameter $4 for $0 $1 $2 $3" | tee -a $LOGDIR/$LOGNAM
+            printUsage
+            exit 1
+         fi
+      else
+         echo "Error: --- wrong parameter $3 for $0 $1 $2 $3 $4 $5" | tee -a $LOGDIR/$LOGNAM
+         printUsage
+         exit 1
+      fi
+   fi
+   params="$action $target $targetCell $jvmRule $jvmName"
+   "${action}"Cells $targetCell $jvmRule $jvmName
+   exit
+fi
+      
+if [ $# -eq 4 ]
+then
+   if [ "$2" = "was" ]
+   then
+      if [ "$3" = "all" ]
+      then
+         targetCell="all"
+      else
+         if cat $WAS_CELLS | awk -F":" '{print $4}' | grep $3 > /dev/null 2>&1
+         then
+            targetCell=$3
+            jvmRule="all"
+         else
+            echo "Error: --- wrong parameter $3 for $0 $1 $2" | tee -a $LOGDIR/$LOGNAM
+            printUsage
+            exit 1
+         fi
+      fi
+      if [ "$action" = "start" ]
+      then
+         case "$4" in
+            jvmsonly|nojvms|all|laststop|steadystate)
+               jvmRule=$4
+            ;;
+            *)
+               echo "Error: --- wrong parameter $4 for $0 $1 $2 $3" | tee -a $LOGDIR/$LOGNAM
+               printUsage
+               exit 1
+            ;;
+         esac
+      fi
+      if [ "$action" = "stop" ]
+      then
+          case "$4" in
+            jvmsonly|all)
+            jvmRule=$4
+            ;;
+            *)
+               echo "Error: --- wrong parameter $4 for $0 $1 $2 $3" | tee -a $LOGDIR/$LOGNAM
+               printUsage
+               exit 1
+            ;;
+          esac
+      fi
+      params="$action $target $targetCell $jvmRule"
+      "${action}"Cells $targetCell $jvmRule
+      exit
+   else
+      echo "Error: --- wrong parameter $2 for $0 $1 $2 $3 $4" | tee -a $LOGDIR/$LOGNAM
+      printUsage
+      exit 1
+   fi
+fi
+
+if [ "$2" = "ecv" ]
+then
+   if [ $# -ne 3 ]
+   then
+      echo "Error: --- wrong number of parameters $# for $2" | tee -a $LOGDIR/$LOGNAM
+      printUsage
+      exit 1
+   fi
+   if [ "$action" = "stop" ]
+   then
+      if [ "$3" = "all" ]
+      then
+	 ecvName=$3
+      else
+	 if echo $3 | egrep "ecvup|ecvdown" | grep html > /dev/null 2>&1
+         then
+            ecvName=$3
+         else
+            echo "Error: --- wrong parameter $3 for $0 $1 $2" | tee -a $LOGDIR/$LOGNAM
+            printUsage
+            exit 1
+	 fi
+      fi
+   fi
+   if [ "$action" = "start" ]
+   then
+      if [ "$3" = "laststop" ] || [ "$3" = "steadystate" ] || [ "$3" = "all" ]
+      then
+         ecvName=$3
+      else
+         if echo $3 | egrep "ecvup|ecvdown" | grep html > /dev/null 2>&1
+         then
+            ecvName=$3
+         else
+            echo "Error: --- Wrong ECV name parameter $3" | tee -a $LOGDIR/$LOGNAM
+            printUsage
+            exit 1
+         fi
+      fi
+   fi
+   "${action}"ECV $ecvName
+   exit 
+fi
+if [ "$2" = "ihs" ]
+then
+   if [ $# -ne 3 ]
+   then
+      echo "Error: --- wrong number of parameters $# for $2" | tee -a $LOGDIR/$LOGNAM
+      printUsage
+      exit 1
+   fi
+   if [ "$action" = "stop" ]
+   then
+      if [ "$3" = "all" ]
+      then
+	 ihsInstance=$3
+      else
+	 if grep $3 $IHS_STATE > /dev/null 2>&1
+         then
+	    ihsInstance=$3
+         else	    
+		 echo "Error: --- wrong parameter $3 for $0 $1 $3" | tee -a $LOGDIR/$LOGNAM
+            printUsage
+            exit 1
+         fi
+      fi
+   fi
+   if [ "$action" = "start" ]
+   then
+      if [ "$3" = "laststop" ] || [ "$3" = "steadystate" ] || [ "$3" = "all" ]
+      then
+         ihsInstance=$3
+      else
+         if grep $3 $IHS_STATE > /dev/null 2>&1
+         then
+            ihsInstance=$3
+         else
+            echo "Error: --- Wrong IHS name parameter $3" | tee -a $LOGDIR/$LOGNAM
+            printUsage
+            exit 1
+         fi   
+      fi
+   fi
+   "${action}"IHS $ihsInstance
+fi
